@@ -53,7 +53,7 @@ The system offers increased precision through intensive statistical sampling. Th
 ## Process Stability and Reliability
 Given the long-duration nature of processing tasks, the system includes built-in safety mechanisms:
 * **Robust Logging:** Immediate saving of results to CSV/JSON files after every processed page.
-* **Inference Optimization:** Models are exported to **ONNX** format, achieving a 3x increase in inference speed and lower VRAM/RAM consumption.
+* **Inference Optimization:** Models are exported to **ONNX** format for faster inference.
 * **Fault Tolerance:** Automatic skipping of corrupted image files without interrupting the session.
 * **VRAM Management:** Frequent clearing of GPU memory (`torch.cuda.empty_cache()`) to prevent Out-Of-Memory errors during heavy Bayesian sampling.
 
