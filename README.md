@@ -27,7 +27,7 @@ High-variance regions (flagged as "uncertain") are routed to a **Capsule Network
 * **Objective:** CapsNet excels at disambiguating visually similar clusters (e.g., *m* vs *nn*, *u* vs *n*) that standard CNNs often fail to distinguish.
 
 ### Semantic Refiner: ByT5-Base Transformer
-The final refinement stage is handled by a **ByT5-Base Transformer** operating at the byte level, providing high resistance to spelling errors and out-of-vocabulary (OOV) characters.
+The final refinement stage is handled by a **ByT5-Base Transformer** operating at the byte level, providing high resistance to spelling errors and out-of-vocabulary characters.
 * **Contextual Awareness:** A *Contextual Sliding Window* mechanism feeds the context of previous lines into the current word analysis.
 * **Beam Search:** A width of **k=20** explores a broad linguistic probability tree, crucial for automatically splitting physically joined words.
 
