@@ -46,22 +46,9 @@ The system offers increased precision through intensive statistical sampling. Th
 | MC Dropout Sampling | 1 pass | 64 passes |
 | CapsNet Routing | 3 iterations | 9 iterations |
 | Beam Search Width | 3 candidates | 20 candidates |
-| **Correction Time** | ~15 sec / page | **< 3 min / page** |
-| **Target CER** | ~3.5% | **~2.5%** |
 
 ---
 
-## Performance Metrics After Adaptation
-After a full adaptation cycle to a specific handwriting style, the system achieves the following benchmarks:
-
-* **CER (Character Error Rate):** ~2.5%
-* **WER (Word Error Rate):** ~6.0%
-
-The CER is calculated based on the Levenshtein distance:
-$$CER = \frac{S + D + I}{N}$$
-Where $S$ represents substitutions, $D$ deletions, $I$ insertions, and $N$ is the total number of characters in the ground truth.
-
----
 
 ## Process Stability and Reliability
 Given the long-duration nature of processing tasks, the system includes built-in safety mechanisms:
