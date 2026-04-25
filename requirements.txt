@@ -1,0 +1,61 @@
+# BAZY I CHMURA
+redis==5.0.1           # Klient bazy in-memory i brokera wiadomości
+pymongo>=4.6.0         # Sterownik do MongoDB (musi być, żeby App/Worker.py mógł pisać do bazy)
+motor                  # Asynchroniczny klient MongoDB
+minio                  # Obsługa Object Storage (kompatybilne z AWS S3)
+python-dotenv          # Do wczytywania zmiennych środowiskowych (MONGO_URL, REDIS_HOST)
+
+# UCZENIE MASZYNOWE I INFRASTRUKTURA
+torch>=2.2.0           # Stabilne torch.amp.autocast i natywna atencja SDPA
+torchvision>=0.17.0    # Ścisła synchronizacja z torch 2.2.0 (uniknięcie błędów binarnych C++)
+torchaudio             # Niezbędne jako zależność dla niektórych tokenizerów i modeli multimodalnych
+tensorboard            # Wizualizacja krzywych uczenia i wag kapsułek w czasie rzeczywistym
+onnx                   # Kwantyzacja
+onnxruntime            # Silnik inferencyjny ONNX. Drastycznie przyspiesza predykcję na produkcji
+peft                   # Multi-tenancy (LoRA / Adaptery użytkowników)
+accelerate>=0.28.0     # Obsługa DeepSpeed i FSDP; niezbędne do treningu na ograniczonym VRAM
+
+# PRZETWARZANIE OBRAZU I ML WIZYJNY
+numpy>=1.24.0,<2.0.0   # Wsparcie dla statycznego typowania (linter). <2.0.0 chroni stabilność ABI
+opencv-python-headless # Podstawa operacji na macierzach obrazu i morfologii (np. dla GVF)
+Pillow                 # Backend do wczytywania obrazów. Krytyczny dla kompatybilności z torchvision
+h5py                   # Wydajny zapis dużych datasetów (np. eMNIST w formie zbuforowanej)
+scikit-image           # Zaawansowane algorytmy przetwarzania (szkieletyzacja, odszumianie znaków)
+albumentations>=1.4.0  # Augmentacja geometryczna; ToTensorV2 zoptymalizowany pod PyTorch 2.x
+ultralytics>=8.0.0     # Wsparcie dla YOLOv8/v10 używanego w detekcji linii i układu strony
+
+# TRANSFORMER I MODELE JĘZYKOWE
+transformers>=4.38.0   # Obsługa Flash Attention 2 i natywna integracja z ByT5
+datasets>=2.18.0       # Optymalne strumieniowanie wielogigabajtowych korpusów tekstowych bez użycia RAM
+evaluate>=0.4.1        # Uniwersalny framework do ewaluacji (zunifikowany interfejs dla WER/CER)
+sentencepiece>=0.2.0   # Backend dla tokenizerów T5/ByT5 (wymaga kompilacji C++ w tle)
+protobuf>=3.20.3       # Protokół serializacji wymagany przez modele Hugging Face do ładowania wag
+pyspellchecker>=0.8.1  # Szybka korekta słownikowa
+scipy                  # Wymagane przez Transformers do operacji na macierzach rzadkich i statystyki
+
+# ANALIZA WYNIKÓW, EKSPERYMENTY I RAPORTY
+fpdf2>=2.7.8           # Raporty PDF
+pandas                 # Zarządzanie tabelami wyników i generowanie raportów do pracy dyplomowej
+matplotlib             # Generowanie wykresów zbieżności i map istotności (Integrated Gradients)
+scikit-learn           # Narzędzia do klasteryzacji błędów i PCA wektorów kapsułek
+tqdm                   # Paski postępu; integracja z tqdm.write dla logów treningowych
+seaborn                # Estetyczne wizualizacje macierzy pomyłek (Confusion Matrix)
+colorama               # Kolorowanie logów w terminalu (czytelność błędów walidacji)
+
+# METRYKI (CER/WER) I SYSTEM
+jiwer                  # Standardowa implementacja Word Error Rate i Character Error Rate
+editdistance           # Niskopoziomowa, szybka implementacja dystansu Levenshteina w C++
+python-Levenshtein     # Drastyczne przyspieszenie obliczeń dystansu edycyjnego
+levenshtein            # Alternatywny wrapper dla algorytmów podobieństwa tekstowego
+nltk                   # Tokenizacja i korpusy językowe do walidacji wyników semantycznych
+psutil                 # Monitorowanie zasobów systemowych
+passlib[bcrypt]        # Obsługa logowania
+
+# BACKEND I KOLEJKOWANIE ZADAŃ
+fastapi                # Framework API
+starlette              # Framework ASGI, na którym bazuje FastAPI
+python-multipart       # Wymagane przez FastAPI do obsługi UploadFile i Form
+uvicorn[standard]      # Serwer z optymalizacjami C++ (szybsza pętla zdarzeń)
+celery>=5.3.6          # Stabilna wersja wspierająca Python 3.10 i wyższe (Worker)
+requests>=2.31.0       # Komunikacja z API
+prometheus-fastapi-instrumentator # Automatyczna ekspozycja metryk FastAPI

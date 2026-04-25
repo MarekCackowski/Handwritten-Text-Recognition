@@ -1,0 +1,132 @@
+services:
+  # Baza Metadanych. Przechowuje historię rozpoznań, współrzędne ramek, poprawki użytkownika i statystyki CER/WER.
+  mongodb:
+    image: mongo:4.4.18
+    container_name: htr_mongo
+    restart: always
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+    networks:
+      - htr-network
+    healthcheck:
+      test: ["CMD", "mongo", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Służy jako broker wiadomości między API a Workerem oraz jako szybki cache dla statusów zadań.
+  redis:
+    image: redis:alpine
+    container_name: htr_redis
+    restart: always
+    ports:
+      - "6379:6379"
+    networks:
+      - htr-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Bazy danych słabo radzą sobie z wielkimi plikami binarnymi. MinIO robi to dobrze, zachowując przy tym porządek w plikach.
+  minio:
+    image: minio/minio
+    container_name: htr_minio
+    restart: always
+    ports:
+      - "9000:9000"    # API S3
+      - "9001:9001"    # Konsola WWW
+    environment:
+      MINIO_ROOT_USER: admin
+      MINIO_ROOT_PASSWORD: admin123
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio_data:/data
+    networks:
+      - htr-network
+
+  htr-api:
+    build: .
+    image: htr-api:v6 # Podbijamy do v6 dla spójności bibliotek
+    container_name: htr_api
+    restart: on-failure
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    command: uvicorn App.Backend:app --host 0.0.0.0 --port 8000
+    environment:
+      - MONGO_URL=mongodb://mongodb:27017
+      - REDIS_HOST=redis
+      - MINIO_URL=minio:9000
+      - PYTHONPATH=/app
+    volumes:
+      # Mapowanie kodu źródłowego (Live-coding)
+      - .:/app
+      # Mapowanie wag modeli i danych użytkownika
+      - ./output_data:/app/output_data
+      - ./user_data:/app/user_data
+      - ./byt5_htr_refiner_final:/app/byt5_htr_refiner_final
+      # Folder z danymi SJP i NPZ na Twoim komputerze
+      - C:\OCR:/app/data
+    networks:
+      - htr-network
+    deploy: # Obsługa GPU dla API (zapobiega ostrzeżeniu NVIDIA)
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [ gpu ]
+
+  # Analityka (celery)
+  htr-worker:
+    build: .
+    image: htr-worker:v6 # Tag obrazu dla nowej wersji
+    container_name: htr_worker # Nazwa kontenera (bez dwukropka!)
+    restart: on-failure
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+    # -P solo jest wymagane dla zadań ML, aby uniknąć problemów z wielowątkowością GPU
+    command: tail -f /dev/null # Pozostawiamy dla ręcznego odpalania treningu
+    environment:
+      - MONGO_URL=mongodb://mongodb:27017
+      - REDIS_HOST=redis
+      - MINIO_URL=minio:9000
+      - PYTHONPATH=/app
+    volumes:
+      - .:/app
+      - ./output_data:/app/output_data
+      - ./user_data:/app/user_data
+      - ./byt5_htr_refiner_final:/app/byt5_htr_refiner_final
+      - C:\OCR:/app/data # Folder z danymi SJP i PHSF
+    networks:
+      - htr-network
+    # Konfiguracja karty NVIDIA
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+# Definicja trwałych woluminów (dane nie znikną po restarcie kontenerów)
+volumes:
+  mongo_data:
+  minio_data:
+
+# Izolowana sieć dla komunikacji między kontenerami
+networks:
+  htr-network:
+    driver: bridge

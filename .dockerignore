@@ -1,0 +1,28 @@
+# Ignoruj wszystko co związane z venv
+Lib/
+lib/
+Scripts/
+scripts/
+Include/
+include/
+pyvenv.cfg
+.venv/
+venv/
+
+# Ignoruj ciężkie foldery (Mapujemy je przez volumes w compose)
+Data/
+data/
+Datasets/
+datasets/
+byt5_htr_refiner_final/
+output_data/
+user_data/
+Output/
+output/
+lm_files/
+
+# Śmieci systemowe
+.idea/
+.git/
+__pycache__/
+*.pyc

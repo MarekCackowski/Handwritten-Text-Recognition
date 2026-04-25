@@ -1,0 +1,35 @@
+# Środowisko wirtualne
+venv/
+.venv/
+Lib/
+Scripts/
+Include/
+bin/
+share/
+pyvenv.cfg
+
+# Pamięć podręczna i kompilaty
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Dane i wagi
+output_data/
+data/
+*.pth
+*.pt
+*.npy
+*.onnx
+
+# IDE i śmieci systemowe
+.idea/
+.vscode/
+.history/
+*.log
+.env
+
+# Ciężkie pliki
+lm_files/
+*.bin
+*.arpa
