@@ -1,9 +1,9 @@
 # CRNN-CN-TR-OCR
-## High-Precision Transcription System for Challenging Manuscripts
+## Transcription System for Handwritten Texts
 
 This system is a solution designed for the high-precision transcription of complex historical (and modern as well) manuscripts. The core architecture is built upon a **triple-verification cascade**, integrating deep sequential learning, geometric morphological analysis, and byte-level semantic correction. 
 
-Optimized for the **Overnight Precision** workflow, the system prioritizes absolute character accuracy and reliability over raw processing speed, making it an ideal tool for archival digitalization and academic research.
+Optimized for the **Overnight Precision** workflow, the system prioritizes absolute character accuracy and reliability over raw processing speed, making it an ideal tool for archival digitalization.
 
 ## Architecture and Technological Pillars
 
