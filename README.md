@@ -60,7 +60,7 @@ Given the long-duration nature of processing tasks, the system includes built-in
 ---
 
 ## Tech Stack
-* **Core AI:** PyTorch, TensorFlow, ByT5 (Transformer), CapsNet
+* **Core AI:** PyTorch, TensorFlow, CRNN, CapsNet, ByT5 (Transformer)
 * **Optimization:** ONNX Runtime, SWA (Stochastic Weight Averaging), EMA
 * **Computer Vision:** OpenCV, Albumentations, NumPy
 * **App/Backend:** FastAPI, PyQt5, TensorBoard
