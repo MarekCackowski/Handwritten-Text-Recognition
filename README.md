@@ -11,18 +11,12 @@ Optimized for the **Overnight Precision** workflow, the system prioritizes absol
 To mitigate errors caused by overlapping lines (intersecting ascenders and descenders), the system employs a cost-graph-based seam carving algorithm. 
 * **Mechanism:** It determines **non-linear seams** to separate lines, ensuring the total ink continuity of every word is preserved even in densely written manuscripts.
 
-### Vision Foundation: Bayesian CRNN and MC Dropout
-The core of the system is a **ResNet-BiGRU** model, enhanced with statistical uncertainty estimation via the **Monte Carlo Dropout** method.
+### Vision Foundation: CRNN and Confidence Scoring
+The core of the system is a **ResNet-BiGRU** model, optimized for accurate sequential feature extraction.
+* **Uncertainty Detection:** The predictive uncertainty is calculated directly from the network's softmax output probabilities. Drops in character-level confidence scores act as a high-precision detector for potential anomalies and segmentation errors.
 
-* **Dual-Mode Logic:** The system supports two operational modes depending on the precision-speed trade-off:
-    * **Standard Mode:** Performs a single forward pass for maximum throughput during real-time interaction.
-    * **Overnight Precision Mode:** Executes **64 stochastic passes** for each word with the Dropout mechanism active to generate a robust probability distribution.
-* **Bayesian Uncertainty:** Based on the variance of the stochastic results, the predictive uncertainty $U(x)$ is calculated. This acts as a high-precision detector for character-level anomalies and segmentation errors.
-
-$$U(x) \approx \frac{1}{T} \sum_{t=1}^{T} (\hat{p}_t - \bar{p})^2$$
-
-### Geometric Expert: Deep Capsule Network (CapsNet)
-High-variance regions (flagged as "uncertain") are routed to a **Capsule Network** for detailed morphological verification.
+### Geometric Expert: Deep Capsule Network
+Low-confidence regions (flagged as "uncertain" by the CRNN) are routed to a **Capsule Network** for detailed morphological verification.
 * **Dynamic Routing:** In "Overnight" mode, the system utilizes 9 routing iterations to analyze hierarchical part-whole relationships (e.g., stroke slants and ligatures).
 * **Objective:** CapsNet excels at disambiguating visually similar clusters (e.g., *m* vs *nn*, *u* vs *n*) that standard CNNs often fail to distinguish.
 
@@ -39,23 +33,31 @@ The system implements a continuous learning mechanism based on real-time user fe
 ---
 
 ## "Overnight Precision" Mode Characteristics
-The system offers increased precision through intensive statistical sampling. This extends inference time but significantly minimizes the requirement for manual human correction.
+The system offers increased precision through intensive morphological and semantic analysis. This extends inference time but significantly minimizes the requirement for manual human correction.
 
 | Parameter | Standard Mode | Overnight Precision |
 | :--- | :--- | :--- |
-| MC Dropout Sampling | 1 pass | 64 passes |
 | CapsNet Routing | 3 iterations | 9 iterations |
 | Beam Search Width | 3 candidates | 20 candidates |
 
 ---
 
+## Interactive Local UI 
+The system is optimized for direct execution on a personal computer workstation, avoiding external cloud dependencies to ensure maximum control and data privacy. 
+* **Visual Diagnostics:** The graphical user interface explicitly highlights uncertain fragments (entire words or specific parts of them) within colored frames on the manuscript image. 
+* **Pipeline Inspection:** By hovering the cursor over any framed word, the user triggers a detailed tooltip displaying the exact progression of the transcription through the architecture:
+  * `crnn result:`
+  * `crnn+capsnet result:`
+  * `final result:` (after Transformer semantic correction)
+
+---
 
 ## Process Stability and Reliability
 Given the long-duration nature of processing tasks, the system includes built-in safety mechanisms:
 * **Robust Logging:** Immediate saving of results to CSV/JSON files after every processed page.
 * **Inference Optimization:** Models are exported to **ONNX** format for faster inference.
 * **Fault Tolerance:** Automatic skipping of corrupted image files without interrupting the session.
-* **VRAM Management:** Frequent clearing of GPU memory (`torch.cuda.empty_cache()`) to prevent Out-Of-Memory errors during heavy Bayesian sampling.
+* **VRAM Management:** Frequent clearing of GPU memory (`torch.cuda.empty_cache()`) to prevent Out-Of-Memory errors during deep routing and broad beam search iterations.
 
 ---
 
