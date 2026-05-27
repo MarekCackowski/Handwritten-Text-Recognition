@@ -12,6 +12,9 @@ import cv2 as cv
 import numpy as np
 import torch
 import torch.nn.functional as func
+import matplotlib.pyplot as plt
+from App.CRNNCNTRHCR import MATRIX_DIR
+from captum.attr import IntegratedGradients
 from datasets import load_dataset
 from evaluate import load
 from spellchecker import SpellChecker
@@ -34,6 +37,8 @@ from Models.DeepCapsNetCharRecognition import CapsNet
 from Preprocessing.OpticalLayoutRecognition import PageToLineSegmentor, LineToWordSegmentor
 from Preprocessing.Preprocessing import Preprocessing
 BASE_DIR = "/app/data"
+VISUAL_DEBUG_DIR = MATRIX_DIR / "visual_debug_output"
+VISUAL_DEBUG_DIR.mkdir(parents=True, exist_ok=True)
 IAM_ROOT = os.path.join(BASE_DIR, "iam_words")
 XML_DIR = os.path.join(IAM_ROOT, "xml")
 FORMS_DIR = os.path.join(IAM_ROOT, "forms")
@@ -496,6 +501,55 @@ class DubiousRegionSelector:
             'x1': min(c['x1'] for c in group),
             'x2': max(c['x2'] for c in group)
         }
+
+
+class VisualExplainer:
+    """ Klasa tłumacząca decyzje modelu CapsNet na czytelne mapy istotności pikseli (XAI). """
+    def __init__(self, model):
+        self.model = model
+        self.model.eval()
+
+        # Inicjalizacja algorytmu Integrated Gradients
+        self.ig = IntegratedGradients(self.forward_wrapper)
+
+    def forward_wrapper(self, inputs, word_context=None):
+        """ Wrapper dla Captum, ponieważ CapsNet zwraca słownik/krotkę, a potrzebny jest Tensor norm. """
+        outputs = self.model(inputs, word_context=word_context)
+
+        # Pobieramy normy kapsułek (prawdopodobieństwa klas)
+        return outputs["norms"] if isinstance(outputs, dict) else outputs[0]
+
+    def explain(self, img_tensor, context_vector, target_class_idx):
+        """ Generuje mapę atrybucji (istotności) dla wybranego znaku. """
+        img_tensor.requires_grad = True
+        
+        # Obliczanie atrybucji
+        attributions = self.ig.attribute(
+            img_tensor,
+            additional_forward_args=(context_vector,),
+            target=target_class_idx,
+            n_steps=24  # Liczba kroków całkowania (im więcej, tym dokładniej)
+        )
+        return attributions.squeeze().cpu().detach().numpy()
+
+    @staticmethod
+    def plot_explanation(img_tensor, attributions, char_label, save_path):
+        """ Tworzy porównanie oryginału z mapą ciepła XAI i zapisuje do pliku. """
+        img = img_tensor.squeeze().cpu().detach().numpy()
+        
+        plt.figure(figsize=(10, 5))
+        plt.subplot(1, 2, 1)
+        plt.title(f"Oryginał: {char_label}")
+        plt.imshow(img, cmap='gray')
+
+        plt.subplot(1, 2, 2)
+        plt.title("Analiza istotności (XAI)")
+        # Nakładamy mapę ciepła (hot) na piksele
+        plt.imshow(attributions, cmap='hot')
+        plt.colorbar()
+
+        plt.savefig(save_path)
+        plt.close()
 
 
 class FinalInferenceEngine:
@@ -1447,17 +1501,26 @@ def run_full_training():
         num_train_epochs=6,
         per_device_train_batch_size=1,  # Mały vRAM, ale nadrabiamy akumulacją
         gradient_accumulation_steps=32,  # Efektywny batch size = 32
-        learning_rate=5e-5,
+        learning_rate=1e-2,  # Wyższy LR dla SGD
         weight_decay=0.01,
         predict_with_generate=True,
         fp16=True, # dla lepszej stabilności Transformera
-        optim="adamw_torch_fused",  # oszczędza vRAM i czas
+        # Wybrano SGD, aby wymusić lepszą generalizację reguł języka polskiego. 
+        # W przeciwieństwie do Adama, SGD rzadziej 'wykuwa słownik na blachę' (overfitting), 
+        # co jest kluczowe, gdy model ma poprawiać nieznane wcześniej rękopisy. 
+        # Jest również matematycznie najlżejszy dla zasobów VRAM.
+        optim="sgd",
+        # Optymalizacja dynamiki uczenia przez Momentum i Nesterova.
+        # momentum=0.9: Nadaje 'pęd' aktualizacji wag, co pozwala uniknąć lokalnych dołków błędu.
+        # nesterov=True: Algorytm 'patrzy w przód', co przyspiesza zbieżność i stabilizuje naukę.
+        optim_args="momentum=0.9,nesterov=True",
         eval_strategy="epoch",
         save_strategy="epoch",
         logging_steps=20,
         report_to="none",  # Wyłączone, by nie zaśmiecać logów
         load_best_model_at_end=True,
-        metric_for_best_model="cer"  # Transformer ma bić rekordy w CER działa, jak słownik
+        metric_for_best_model="cer",  # Transformer ma bić rekordy w CER - działa, jak słownik
+        greater_is_better=False  # Mniejszy CER = lepszy model
     )
 
     trainer = Seq2SeqTrainer(
