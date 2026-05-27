@@ -265,16 +265,13 @@ class DubiousRegionSelector:
         return uncertainty_per_timestep, variance_map, mean_probs
 
     def select_crop_groups(self, crnn_probs, image_tensor, model_ref=None, intensive=False):
-        """ Główna logika selekcji trudnych regionów. Zoptymalizowana pod kątem precyzji bayesowskiej i wykrywania błędów segmentacji. """
+        """ Główna logika selekcji trudnych regionów. Zoptymalizowana pod kątem precyzji bayesowskiej i statystycznego ryzyka (Confusion Matrix). """
         # Przygotowujemy softmax, aby operować na prawdopodobieństwach
         probs = torch.softmax(crnn_probs, dim=-1)
         top1_p, top1_idx = torch.max(probs, dim=-1)
         top2_p, _ = torch.topk(probs, k=2, dim=-1)
 
-        # Znaki wymagające 'drugiego spojrzenia' CapsNetu ze względu na brak ogonków w CRNN
-        polish_force_check = {"a", "c", "e", "l", "n", "o", "s", "z", "x"} # Dość głupia logika, ale nie wiem, co innego
         simple_punctuation = {".", ",", "'", '"'}
-        punctuation_marks = {":", ";", "!", "?", "(", ")", "-"}
 
         img_np = (image_tensor.cpu().numpy().squeeze() * 255).astype(np.uint8)
         width, steps = image_tensor.shape[2], crnn_probs.shape[0]
@@ -285,10 +282,16 @@ class DubiousRegionSelector:
 
         # Estymacja niepewności MC Dropout (Epistemic Uncertainty)
         uncertainty_map, mc_mean_probs = None, None
-        min_margin = (top1_p - top2_p[:, 1]).min().item()
+        
+        # Wektory marginesów między najlepszą a drugą opcją. Niski margines oznacza, że model jest niepewny co do wyboru.
+        margins = (top1_p - top2_p[:, 1])
+        min_margin = margins.min().item()
 
         if model_ref and min_margin < margin_threshold:
-            uncertainty_map, _, mc_mean_probs = self.estimate_uncertainty_mc(model_ref, image_tensor, steps=64)
+            """ Przy trybie nocnym wykonujemy więcej przejść, aby uzyskać stabilniejszą estymację niepewności, kosztem czasu.
+                Przy normalnym trybie wystarczy mniej przejść, aby szybko zidentyfikować najbardziej niepewne znaki. """
+            steps_count = 64 if intensive else 16
+            uncertainty_map, _, mc_mean_probs = self.estimate_uncertainty_mc(model_ref, image_tensor, steps=steps_count)
 
         if uncertainty_map is not None:
             adaptive_threshold = uncertainty_map.mean() + 1.5 * uncertainty_map.std()
@@ -299,32 +302,32 @@ class DubiousRegionSelector:
         for t in range(steps):
             char_idx = top1_idx[t].item()
             char_str = self.idx_to_char.get(char_idx, "")
-            char_lower = char_str.lower()
 
-            # Bezwzględny skip tylko dla kropki i przecinka (za małe)
+            # Bezwzględny skip tylko dla małej interpunkcji
             if char_str in simple_punctuation:
                 continue
 
-            # Sprawdzamy ryzyko polskiego znaku
-            is_polish_target = char_lower in polish_force_check
-            margin = (top1_p[t] - top2_p[t, 1]).item()
+            margin = margins[t].item()
 
             is_uncertain_mc = False
             if uncertainty_map is not None:
-                is_uncertain_mc = uncertainty_map[t].item() > adaptive_threshold or uncertainty_map[
-                    t].item() > absolute_floor
+                is_uncertain_mc = uncertainty_map[t].item() > adaptive_threshold or uncertainty_map[t].item() > absolute_floor
 
-            #  Reguła decyzyjna, czy warto przekazać do CapsNet
-            if is_polish_target or margin < margin_threshold or is_uncertain_mc:
+            # Pobieramy statystyczne ryzyko pomyłki dla tego konkretnego znaku z macierzy pomyłek
+            char_danger_rate = self.danger_zones.get(char_idx, 0.0)
+            
+            # Wymuszamy sprawdzenie przez CapsNet, jeśli znak historycznie mylił się w więcej niż 10% przypadków
+            is_historically_dangerous = char_danger_rate > 0.1
+
+            #  Statystyka (często mylone) lub niski margines (blisko siebie) lub niepewność modelu
+            if is_historically_dangerous or margin < margin_threshold or is_uncertain_mc:
                 center_x = (t + 0.5) * stride
 
-                # Określamy typ dla find_peaks (nawiasy są wysokie, więc 'letter' pasuje lepiej niż 'punctuation')
                 char_type = 'letter'
 
                 adaptive_gaps = self._find_peaks_adaptive(img_np, char_type=char_type)
                 closest_gap = min(adaptive_gaps, key=lambda x: abs(x - center_x), default=center_x)
 
-                # Standardowe okno dla liter i złożonej interpunkcji
                 window_size = 32
 
                 candidates.append({
@@ -333,10 +336,14 @@ class DubiousRegionSelector:
                     'x2': int(min(width, closest_gap + window_size)),
                     'closest_gap': closest_gap,
                     'uncertainty_val': float(uncertainty_map[t]) if uncertainty_map is not None else 0.0,
-                    'is_forced': is_polish_target
+                    'is_forced': is_historically_dangerous
                 })
 
         # Grupowanie i przekazanie do CapsNet
+        if steps > 0:
+            routed_percentage = (len(candidates) / steps) * 100
+            print(f"Przekazano {len(candidates)}/{steps} znaków ({routed_percentage:.1f}%) do CapsNet.")
+
         return self._group_candidates(candidates), mc_mean_probs
 
     @staticmethod
@@ -455,17 +462,35 @@ class CascadeRefinementNetwork:
         self.char_list = char_list
         self.lc_token = "~"
         self.lc_idx = self.encoder.char_to_idx.get(self.lc_token, len(char_list))
-        self.capsnet_mapping = self._get_emnist_62_mapping()
+        self.capsnet_mapping = self._get_polish_80_mapping()
         self.allowed_chars = set(self.capsnet_mapping.values())
         self.matrix_path = matrix_path
 
     @staticmethod
-    def _get_emnist_62_mapping():
-        m = {}
-        for i in range(10): m[i] = chr(48 + i)
-        for i in range(26): m[10 + i] = chr(65 + i)
-        for i in range(26): m[36 + i] = chr(97 + i)
-        return m
+    def _get_polish_80_mapping():
+        """ Nowy słownik tłumaczący 80 indeksów CapsNetu na litery, w tym polskie znaki. """
+        mapping = {}
+        
+        # 0-9: Cyfry
+        for i in range(10): mapping[i] = chr(48 + i)
+        
+        # 10-35: Wielkie litery A-Z
+        for i in range(26): mapping[10 + i] = chr(65 + i)
+        
+        # 36-61: Małe litery a-z
+        for i in range(26): mapping[36 + i] = chr(97 + i)
+        
+        # 62-70: Polskie wielkie znaki
+        polish_upper = ['Ą', 'Ć', 'Ę', 'Ł', 'Ń', 'Ó', 'Ś', 'Ź', 'Ż']
+        for i, char in enumerate(polish_upper):
+            mapping[62 + i] = char
+            
+        # 71-79: Polskie małe znaki
+        polish_lower = ['ą', 'ć', 'ę', 'ł', 'ń', 'ó', 'ś', 'ź', 'ż']
+        for i, char in enumerate(polish_lower):
+            mapping[71 + i] = char
+            
+        return mapping
 
     @staticmethod
     def _preprocess_crop_gpu(crop_tensor):
