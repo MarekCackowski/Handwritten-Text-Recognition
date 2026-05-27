@@ -22,6 +22,7 @@ import cv2 as cv
 from PIL import Image, UnidentifiedImageError
 from torch.utils.data import WeightedRandomSampler
 import json
+import shapiq
 import xml.etree.ElementTree as elTree
 import pandas as pd
 from torchvision.transforms.v2 import functional as f_v2
@@ -693,7 +694,7 @@ class SEBlock(nn.Module):
         super(SEBlock, self).__init__()
         self.fc = nn.Sequential(
             nn.Linear(channels, channels // reduction, bias=False),
-            nn.ReLU(inplace=True),
+            nn.PReLU(channels // reduction),
             nn.Linear(channels // reduction, channels, bias=False),
             nn.Sigmoid()
         )
@@ -712,10 +713,14 @@ class ResidualBlock(nn.Module):
         super(ResidualBlock, self).__init__()
         self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=False)
         self.bn1 = nn.BatchNorm2d(out_channels)
-        self.relu = nn.ReLU(inplace=True)
+        self.prelu1 = nn.PReLU(out_channels)
+        
         self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False)
         self.bn2 = nn.BatchNorm2d(out_channels)
         self.se = SEBlock(out_channels)
+        
+        self.prelu2 = nn.PReLU(out_channels)
+        
         self.shortcut = nn.Sequential()
         if stride != 1 or in_channels != out_channels:
             self.shortcut = nn.Sequential(
@@ -725,11 +730,13 @@ class ResidualBlock(nn.Module):
 
     def forward(self, x):
         identity = self.shortcut(x)
-        out = self.relu(self.bn1(self.conv1(x)))
+        
+        out = self.prelu1(self.bn1(self.conv1(x)))
         out = self.bn2(self.conv2(out))
         out = self.se(out)
+        
         out += identity
-        return self.relu(out)
+        return self.prelu2(out)
 
 
 class SpatialAttention(nn.Module):
@@ -854,13 +861,13 @@ class DeformableBlock(nn.Module):
         self.dcn = DeformConv2d(in_channels, out_channels, kernel_size=3, padding=1, stride=stride)
 
         self.bn = nn.InstanceNorm2d(out_channels, affine=True)
-        self.relu = nn.ReLU(inplace=True)
+        self.prelu = nn.PReLU(out_channels)
 
     def forward(self, x):
         offsets = self.offset_conv(x)
         out = self.dcn(x, offsets)
         out = self.bn(out)
-        return self.relu(out)
+        return self.prelu(out)
 
 
 class BoundarySpatialAttention(nn.Module):
@@ -1044,8 +1051,7 @@ class CapsNet(nn.Module):
            - Zone Head: Przewiduje strefę znaku (górna/środkowa/dolna).
            - Geometry Head: Przewiduje cechy morfologiczne (wysokość, gęstość pikseli, aspect ratio).
            W połączeniu daje to kompletny wgląd w kształt znaku. """
-
-    def __init__(self, num_classes=89, context_dim=1024):
+    def  __init__(self, num_classes=89, context_dim=1024):
         super().__init__()
         self.num_classes = num_classes
 
@@ -1074,10 +1080,14 @@ class CapsNet(nn.Module):
         self.primary = PrimaryCaps(in_channels=256, out_channels=16, dim_caps=8, kernel_size=9, stride=3)
         self.num_primary = 1024
 
-        # Macierz wag dla routingu: Mapuje kapsuły na num_classes
-        self.W = nn.Parameter(torch.randn(1, self.num_primary, num_classes, 32, 8) * 0.05)
+        # Dzielimy wejście na 16 niezależnych podprzestrzeni (do testowania jeszcze)
+        self.num_groups = 16
+        self.caps_per_group = self.num_primary // self.num_groups
 
-        # Routingn z użyciem mechanizmu atencji
+        # Nowa macierz wag uwzględniająca wymiar grup
+        self.W = nn.Parameter(torch.randn(1, self.num_groups, self.caps_per_group, num_classes, 32, 8) * 0.05)
+
+        # Routing z użyciem mechanizmu atencji
         self.routing = AttentionRouting(dim_caps=32)
 
         # Fuzja
@@ -1133,23 +1143,33 @@ class CapsNet(nn.Module):
 
         # Przetwarzanie kapsułkowe
         u = self.primary(features)
-        u = u[:, :, None, :, None]
 
-        # Mapujemy 1024 kapsuły wejściowe (8-wym) na 74 kapsuły klasowe (32-wym)
-        u_hat = torch.matmul(self.W, u).squeeze(-1)
+        # Dzielenie kapsuł na grupy (divide na 16 podprzestrzeni)
+        u_grouped = u.view(batch_size, self.num_groups, self.caps_per_group, 1, -1, 1)
 
-        # Dynamiczny routing (Iteracyjne głosowanie kapsułek)
-        v_j = self.routing(u_hat, num_iterations=num_iterations)
+        # Mapowanie grupowane 1024 kapsuł wejściowych na wyższe kapsuły klasowe
+        u_hat = torch.matmul(self.W, u_grouped).squeeze(-1)
+
+        # Spłaszczanie wymiarów batch i group dla AttentionRouting
+        u_hat_reshaped = u_hat.view(batch_size * self.num_groups, self.caps_per_group, self.num_classes, 32)
+
+        # Dynamiczny routing
+        v_j_grouped = self.routing(u_hat_reshaped, num_iterations=num_iterations)
+
+        # Agregacja wyników (Conquer)
+        v_j_unflattened = v_j_grouped.view(batch_size, self.num_groups, self.num_classes, 32)
+        s_final = v_j_unflattened.sum(dim=1)
+
+        # Squashing - aktywacja ostatecznego, złączonego wektora decyzyjnego
+        norm_squared = (s_final ** 2).sum(dim=-1, keepdim=True)
+        scale = norm_squared / (1 + norm_squared) / torch.sqrt(norm_squared + 1e-8)
+        v_j = scale * s_final
 
         # Integracja informacji semantycznej z CRNN/Transformera z cechami wizualnymi CapsNet
         if word_context is not None and confidence is not None and crnn_probs is not None:
-            v_j = self.fusion(v_j, word_context, confidence, crnn_probs)
-
-        if word_context is not None and confidence is not None and crnn_probs is not None:
-            # Jeśli nie podano lang_id, domyślnie 0 (PL) dla bezpieczeństwa
             if lang_id is None:
-                lang_id = torch.zeros(x.size(0), dtype=torch.long, device=x.device)
-
+                # Jeśli nie podano lang_id, domyślnie 0 (PL) dla bezpieczeństwa
+                lang_id = torch.zeros(batch_size, dtype=torch.long, device=x.device)
             v_j = self.fusion(v_j, word_context, confidence, crnn_probs, lang_id)
 
         # Obliczanie prawdopodobieństw i niepewności aleatorycznej
@@ -1165,7 +1185,7 @@ class CapsNet(nn.Module):
         else:
             y_indices = y.argmax(dim=-1) if y.dim() > 1 else y
 
-        # Maskowanie: przekazujemy tylko wektor wybranej klasy
+        # Przekazujemy tylko wektor wybranej klasy
         masked_v = v_j[torch.arange(batch_size), y_indices]
         stochastic_v = self.dropout(masked_v)
 
@@ -1194,57 +1214,65 @@ class CapsNet(nn.Module):
             else:
                 # Pozwalamy warstwie Deformable i Attention na adaptację
                 param.requires_grad = True
-        print(f"[{now()}] Backbone częściowo odmrożony (Deformable + Attention).")
+        print("Backbone częściowo odmrożony (Deformable + Attention).")
 
     def unfreeze_backbone(self):
         for param in self.parameters():
             param.requires_grad = True
-        print(f"[{now()}] Cały model odmrożony.")
+        print("Cały model odmrożony.")
 
-    def generate_explanation(self, image_tensor: torch.Tensor, target_class: int, steps: int = 20) -> np.ndarray:
-        """ Generuje mapę istotności wskazującą piksele kluczowe dla predykcji konkretnej klasy przez CapsNet. """
+    def generate_shapiq_explanation(self, image_tensor: torch.Tensor, target_class: int, grid_size: tuple = (4, 8), budget: int = 512):
+        """ Generuje mapę interakcji Shapleya  dla obrazu wejściowego. Zamiast szukać pojedynczych pikseli,
+            dzieli obraz na siatkę łatek i bada efekty interakcji pomiędzy nimi."""
         self.eval()
         device = image_tensor.device
 
-        # Przygotowanie wejścia i linii bazowej (czarny obraz)
-        img_input = image_tensor.clone().detach().requires_grad_(True)
-        baseline = torch.zeros_like(img_input).to(device)
-        all_grads = []
+        # Pobieramy wymiary obrazu
+        B, C, H, W = image_tensor.shape
+        n_players = grid_size * grid_size[1]
+        patch_h = H // grid_size
+        patch_w = W // grid_size[1]
 
-        # Implementacja aproksymacji całki metodą Riemanna
-        for i in range(steps):
-            # Interpolacja liniowa między baseline a oryginałem
-            alpha = float(i) / steps
-            integrated_img = baseline + alpha * (img_input - baseline)
-            integrated_img = integrated_img.clone().detach().requires_grad_(True)
+        def model_predict_wrapper(masks: np.ndarray) -> np.ndarray:
+            """ Otrzymuje binarną macierz koalicji i zwraca predykcje modelu. """
+            num_coalitions = masks.shape
+            scores = list()
 
-            # Forward pass
-            outputs = self.forward(integrated_img)
+            with torch.no_grad():
+                # Przetwarzamy maski w mniejszych paczkach dla optymalizacji na GPU
+                batch_size = 32
+                for i in range(0, num_coalitions, batch_size):
+                    mask_batch = masks[i:i + batch_size]
+                    current_bs = mask_batch.shape
 
-            # Obsługa różnych formatów wyjścia (słownik vs krotka)
-            norms = outputs["norms"] if isinstance(outputs, dict) else outputs[0]
+                    # Tworzymy czarne tło dla wszystkich obrazów w batchu
+                    masked_imgs = torch.zeros(current_bs, C, H, W, device=device)
 
-            score = norms[0, target_class]
+                    # Nakładamy oryginalne piksele tylko tam, gdzie maska jest aktywna
+                    for b in range(current_bs):
+                        for row in range(grid_size):
+                            for col in range(grid_size[1]):
+                                player_idx = row * grid_size[1] + col
+                                if mask_batch[b, player_idx] == 1:
+                                    masked_imgs[b, :, row * patch_h:(row + 1) * patch_h, col * patch_w:(col + 1) * patch_w] = image_tensor[0, :, row * patch_h:(row + 1) * patch_h, col * patch_w:(col + 1) * patch_w]
 
-            # Zerowanie gradientów i wsteczna propagacja
-            self.zero_grad()
-            score.backward()
+                    # Predykcja CapsNetu dla całej paczki zamaskowanych obrazów
+                    outputs = self.forward(masked_imgs)
 
-            # Bezpieczne pobranie gradientu z obsługą lintera
-            grad = integrated_img.grad
-            if grad is not None:
-                all_grads.append(grad.detach().abs())
-            else:
-                # Fallback na zera, jeśli gradient nie powstał
-                all_grads.append(torch.zeros_like(integrated_img))
+                    # Wyciąganie wyniku
+                    norms = outputs["norms"] if isinstance(outputs, dict) else outputs
+                    batch_scores = norms[:, target_class].cpu().numpy()
+                    scores.extend(batch_scores)
 
-        # Obliczenie średniego gradientu (przybliżenie całki)
-        avg_grads = torch.stack(all_grads).mean(dim=0)
+            return np.array(scores)
 
-        # Redukcja kanałów (max po kolorach) do formy 2D
-        saliency, _ = torch.max(avg_grads, dim=1)
+        # Inicjalizacja szybkiego estymatora dla interakcji maksymalnie 2-go rzędu
+        approximator = shapiq.ProxySPEX(n=n_players, index="k-SII", max_order=2)
 
-        return saliency.squeeze().cpu().numpy()
+        # Obliczenie wartości przy określonym budżecie ewaluacji modelu
+        interaction_values = approximator.approximate(budget=budget, game=model_predict_wrapper)
+
+        return interaction_values
 
     def predict_char(self, crop_tensor, encoder, word_context=None, confidence=None, boundaries=None, crnn_probs=None, mc_samples=10):
         """ Zwraca szczegółową predykcję wraz z wektorem kapsułki dla modelu językowego.
@@ -1263,10 +1291,25 @@ class CapsNet(nn.Module):
                 if boundaries is not None:
                     features = self.boundary_gate(features, boundaries)
 
-                u_hat = torch.matmul(self.W, self.primary(features)[:, :, None, :, None]).squeeze(-1)
+                u = self.primary(features)
+                batch_size = u.size(0)
 
-                # Attention Routing: Uzgodnienie spójności między kapsułkami i wyliczenie wyjścia v_j
-                v_j = self.routing(u_hat, num_iterations=3)
+                # Zastosowanie Divide-and-Conquer
+                u_grouped = u.view(batch_size, self.num_groups, self.caps_per_group, 1, -1, 1)
+                u_hat = torch.matmul(self.W, u_grouped).squeeze(-1)
+                u_hat_reshaped = u_hat.view(batch_size * self.num_groups, self.caps_per_group, self.num_classes, 32)
+
+                # Attention Routing wewnątrz mniejszych grup
+                v_j_grouped = self.routing(u_hat_reshaped, num_iterations=3)
+
+                # Ostateczna fuzja grup decyzyjnych
+                v_j_unflattened = v_j_grouped.view(batch_size, self.num_groups, self.num_classes, 32)
+                s_final = v_j_unflattened.sum(dim=1)
+
+                # Squashing
+                norm_squared = (s_final ** 2).sum(dim=-1, keepdim=True)
+                scale = norm_squared / (1 + norm_squared) / torch.sqrt(norm_squared + 1e-8)
+                v_j = scale * s_final
 
                 # Deep Fusion: Integracja wiedzy semantycznej z cechami morfologicznymi
                 if word_context is not None and confidence is not None and crnn_probs is not None:
@@ -1286,20 +1329,32 @@ class CapsNet(nn.Module):
         # Estymacja wariancji epistemicznej (jak bardzo model waha się przy różnych "rzutach")
         epistemic_variance = torch.stack(all_probs).var(dim=0).mean()
 
+        # Pobieramy 2 najwyższe predykcje, aby sprawdzić ich dystans ("margin")
         top_probs, top_indices = torch.topk(avg_probs, 2, dim=-1)
 
-        # Entropia Shannona: miara niepewności aleatorycznej (jak bardzo zaszumiony jest obraz)
+        # Entropia Shannona: miara niepewności aleatorycznej
         entropy = -torch.sum(avg_probs * torch.log(avg_probs + 1e-10))
 
-        winning_idx = top_indices[0].item()
+        # Wydobycie indeksów — obsługa 1D oraz 2D
+        if top_indices.dim() == 1:
+            # avg_probs był rzeczywiście 1D
+            winning_idx = top_indices[0].item()
+            conf = top_probs[0].item()
+            margin = (top_probs[0] - top_probs[1]).item() if top_probs.numel() > 1 else 0.0
+        else:
+            # avg_probs jest 2D
+            winning_idx = top_indices[0, 0].item()
+            conf = top_probs[0, 0].item()
+            margin = (top_probs[0, 0] - top_probs[0, 1]).item() if top_probs.size(1) > 1 else 0.0
+
 
         # Wyciągamy morfologiczny wektor zwycięskiej litery dla pełniejszej decyzji Transformera
-        winning_capsule_vector = avg_capsules[0, winning_idx, :]
+        winning_capsule_vector = avg_capsules[0, winning_idx, :] if avg_capsules.dim() == 3 else avg_capsules[winning_idx, :]
 
         return {
             'char': encoder.decode(winning_idx),
-            'confidence': top_probs[0].item(),
-            'margin': top_probs[0].item() - top_probs[1].item(),  # Różnica w pewności (Top1 - Top2)
+            'confidence': conf,
+            'margin': margin,
             'entropy': entropy.item(),  # Niejednoznaczność optyczna
             'epistemic_unc': epistemic_variance.item(),  # Niewiedza architektoniczna modelu
             'capsule_embedding': winning_capsule_vector  # Gęsty wektor cech dla modelu językowego
@@ -1319,47 +1374,6 @@ def unfreeze_backbone(self):
     for param in self.parameters():
         param.requires_grad = True
     print(f"[{now()}] Cały model odmrożony.")
-
-
-def generate_explanation(self, image_tensor: torch.Tensor, target_class: int, steps: int = 20) -> np.ndarray:
-    """ Generuje mapę istotności dla predykcji CapsNet. Pozwala zrozumieć, które piksele wpłynęły na aktywację konkretnej kapsułki. """
-    self.eval()
-    device = image_tensor.device
-
-    # Inicjalizacja wejścia i bazy (czarny obraz)
-    img_input = image_tensor.clone().detach().requires_grad_(True)
-    baseline = torch.zeros_like(img_input).to(device)
-    all_grads = []
-
-    for i in range(steps):
-        # Interpolacja liniowa między bazą a obrazem
-        alpha = float(i) / steps
-        integrated_img = baseline + alpha * (img_input - baseline)
-        integrated_img = integrated_img.clone().detach().requires_grad_(True)
-
-        # Forward pass (używamy self(x) zamiast self.forward(x))
-        output = self(integrated_img)
-        norms = output["norms"] if isinstance(output, dict) else output[0]
-
-        score = norms[0, target_class]
-        self.zero_grad()
-        score.backward()
-
-        # Pobranie gradientu
-        grad = integrated_img.grad
-        if grad is not None:
-            all_grads.append(grad.detach().abs())
-        else:
-            # Fallback na zera, jeśli gradient nie powstał (ucisza lintera)
-            all_grads.append(torch.zeros_like(integrated_img))
-
-    # Obliczanie średniego gradientu (aproksymacja całki)
-    avg_grads = torch.stack(all_grads).mean(dim=0)
-
-    # Redukcja kanałów do formy 2D (Saliency Map)
-    saliency, _ = torch.max(avg_grads, dim=1)
-
-    return saliency.squeeze().cpu().numpy()
 
 
 class CapsuleFusionDataset(torch.utils.data.Dataset):
@@ -2734,8 +2748,8 @@ def run_phase(phase_id, model, device, encoder, current_zone_map, test_loader, n
         ds_e = UniversalContextWrapper(RAMCachedEMNIST(EMNISTWithContext(ds_e_raw, encoder), current_zone_map))
 
         # Dane PHSF (polskie diakrytyki)
-        ds_phsf = UniversalContextWrapper(
-            PHSFDataset(root_dir=r"C:\OCR\PHSF\phsf\znaki\png", encoder=encoder, transform=emnist_transform_aggressive))
+        root_dir = os.path.join(BASE_DIR, "PHSF", "phsf", "znaki", "png")
+        ds_phsf = UniversalContextWrapper(PHSFDataset(root_dir=root_dir, encoder=encoder, transform=emnist_transform_aggressive))
 
         # Dane PURE (z ligaturami z treningu CRNN)
         full_ds_p = HardCharsDataset(root_dir=CRNN_CUSTOM_SAMPLES, encoder=encoder, case_type="pure", transform=pure_transform_standard)
@@ -2770,7 +2784,8 @@ def run_phase(phase_id, model, device, encoder, current_zone_map, test_loader, n
         train_and_save.loader_pure_val = DataLoader(UniversalContextWrapper(ds_p_val), batch_size=BATCH_SIZE, shuffle=False)
 
         # Dane PHSF
-        ds_phsf = UniversalContextWrapper(PHSFDataset(root_dir=r"C:\OCR\PHSF_Data", encoder=encoder, transform=pure_transform_standard))
+        root_dir = os.path.join(BASE_DIR, "PHSF_Data")
+        ds_phsf = UniversalContextWrapper(PHSFDataset(root_dir=root_dir, encoder=encoder, transform=pure_transform_standard))
 
         # Dane eMNIST
         ds_e = UniversalContextWrapper(RAMCachedEMNIST(EMNISTWithContext(
@@ -2796,14 +2811,17 @@ def run_phase(phase_id, model, device, encoder, current_zone_map, test_loader, n
         tqdm.write(f"[{now()}] Faza HARD_MINING: Polski + Błędy CRNN")
 
         if not os.path.exists(CRNN_CUSTOM_SAMPLES) or len(os.listdir(CRNN_CUSTOM_SAMPLES)) < 100:
-            mine_errors_from_cvl_pages(pipeline=pipeline, cvl_db_path=r"C:\OCR\cvl-database\testset", save_root=CRNN_CUSTOM_SAMPLES)
+            cvl_db_path = os.path.join(BASE_DIR, "cvl-database", "testset")
+            mine_errors_from_cvl_pages(pipeline=pipeline, cvl_db_path=cvl_db_path, save_root=CRNN_CUSTOM_SAMPLES)
 
         # eMNIST (baza), Hard (błędy), Pure (czyste pismo), PHSF (polskie znaki).
         ds_e = UniversalContextWrapper(cached_emnist_train)
         ds_h = UniversalContextWrapper(
             HardCharsDataset(CRNN_CUSTOM_SAMPLES, encoder, "hard_case", crnn_error_transform))
         ds_p = UniversalContextWrapper(HardCharsDataset(CRNN_CUSTOM_SAMPLES, encoder, "pure", pure_transform_standard))
-        ds_phsf = UniversalContextWrapper(PHSFDataset(root_dir=r"C:\OCR\PHSF\phsf\znaki\png", encoder=encoder, transform=crnn_error_transform))
+
+        root_dir=os.path.join(BASE_DIR, "PHSF_Data")
+        ds_phsf = UniversalContextWrapper(PHSFDataset(root_dir=root_dir, encoder=encoder, transform=crnn_error_transform))
 
         # Loader zbalansowany pod kątem częstej ekspozycji na błędy wizualne
         loader_hard = build_hard_mining_loader(ds_e, ds_h, ds_p, ds_phsf, BATCH_SIZE)
@@ -2934,7 +2952,7 @@ if __name__ == "__main__":
 
     # Uruchomienie pętli faz
     model_crnn = ResNetCRNN(num_classes=encoder.get_num_classes()).to(DEVICE)
-    crnn_weights = r"C:\OCR\HandwrittenTextRecognition\output_data\checkpoints\hwr\WordLevelResNetCRNN.pth"
+    crnn_weights = CRNN_CHECKPOINT
     if os.path.exists(crnn_weights):
         model_crnn.load_weights(crnn_weights)
     pipeline = HTRPipeline(model_crnn, encoder)
