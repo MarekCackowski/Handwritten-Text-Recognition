@@ -1,5 +1,6 @@
 import os
-from unittest import loader
+
+from PIL import Image
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
@@ -12,7 +13,6 @@ root_dir = os.path.dirname(current_dir)
 if root_dir not in sys.path:
     sys.path.insert(0, root_dir)
 
-import concurrent.futures
 import difflib
 import gc
 import glob
@@ -44,9 +44,11 @@ from scipy.ndimage import map_coordinates, gaussian_filter
 from skimage.filters import threshold_sauvola
 from sklearn.metrics import confusion_matrix
 from torch.optim.swa_utils import AveragedModel
-from torch.utils.data import Dataset, DataLoader, ConcatDataset, Sampler, WeightedRandomSampler
+from torch.utils.data import Dataset, DataLoader, ConcatDataset, Sampler, WeightedRandomSampler, random_split, Subset
 from torch.utils.tensorboard import SummaryWriter
+import torchvision.transforms as transforms
 from tqdm import tqdm
+import matplotlib.pyplot as plt
 import psutil
 from Preprocessing.Preprocessing import Preprocessing # type: ignore . W Dockerze jest ok
 
@@ -93,14 +95,23 @@ else:
 # Konfiguracja workerów (przeszedłem na Linux, więc więcej)
 WORKERS_MAIN = 4 # Augmentacje
 WORKERS_FINE = 8
-WORKERS_HARD_MINING = 4 # H5PY na Linuxie działa stabilnie przy wielu wątkach, jeśli plik jest otwierany w __getitem__
 
 # Urządzenie
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-# Podstawowe ścieżki
+# Definicja głównego katalogu projektu (wewnątrz kontenera)
+if IS_DOCKER:
+    BASE_PATH = "/app"
+    DATA_ROOT = "/app/Data"
+    OUTPUT_BASE = os.path.join(BASE_PATH, "output_data")
+else:
+    # Używamy ścieżki do lokalnego katalogu projektu
+    BASE_PATH = os.path.expanduser("~/OCR/HandwrittenTextRecognition")
+    DATA_ROOT = os.path.join(BASE_PATH, "Data")
+    OUTPUT_BASE = os.path.join(BASE_PATH, "output_data")
+
+# Podstawowa ścieżka do zbioru IAM
 RAW_SOURCE_DIR = os.path.normpath(os.path.join(DATA_ROOT, "iam_words", "words"))
-PROCESSED_DATA_DIR = os.path.normpath(os.path.join(DATA_ROOT, "iam_words", "words_processed"))
 
 # Checkpointy i wyniki
 CHECKPOINT_FOLDER = os.path.normpath(os.path.join(OUTPUT_BASE, "checkpoints", "hwr"))
@@ -108,14 +119,12 @@ CHECKPOINT_PATH = os.path.join(CHECKPOINT_FOLDER, "WordLevelResNetCRNN.pth")
 CER_PATH = os.path.join(CHECKPOINT_FOLDER, "best_cer_model.pth")
 
 # Pliki baz danych H5
-IAM_LINES_H5_PATH = "/app/Data/ocr_dataset_cleaned.h5"
-IAM_WORDS_H5_PATH = "/app/Data/iam_words.h5"
-CVL_H5_PATH = "/app/Data/cvl_lines_en.h5"
+IAM_WORDS_H5_PATH = os.path.join(DATA_ROOT, "clean_dataset_processed.h5")
 
 # Pozostałe ścieżki pomocnicze
 MAIN_PHASE_COMPLETE_FILE = os.path.join(CHECKPOINT_FOLDER, "main_complete.txt")
 FINE_COMPLETE_FILE = os.path.join(CHECKPOINT_FOLDER, "fine_complete.txt")
-HARD_MINING_COMPLETE_FILE = os.path.join(CHECKPOINT_FOLDER, "hard_mining_complete.txt")
+ALIGNMENT_COMPLETE_FILE = os.path.join(CHECKPOINT_FOLDER, "alignment_complete.txt")
 CAPSNET_DATA_DIR = os.path.normpath(os.path.join(DATA_ROOT, "archive", "iam_words"))
 VISUAL_DEBUG_DIR = os.path.join(CHECKPOINT_FOLDER, "visual_debug_CRNN")
 LOG_DIR = os.path.join(CHECKPOINT_FOLDER, "logs")
@@ -127,13 +136,10 @@ os.makedirs(LOG_DIR, exist_ok=True)
 
 # Konfiguracja GPU pod uczenie i Tensorboard do podsumowań CER/WER
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-writer = SummaryWriter(log_dir=LOG_DIR)
+def get_writer(path):
+    return SummaryWriter(log_dir=path)
 
 IMAGE_HEIGHT = 64
-WORD_WIDTH = 576
-LINE_WIDTH = 3000
-TOTAL_HARD_LINES = 64
-SAFE_BATCH_SIZE = 4
 STOP_THRESHOLD = 0.001
 VAL_LOSS_THRESHOLD = 0.0002
 ENTROPY_THRESHOLD = 0.5
@@ -143,66 +149,42 @@ PURE_RATE = 0.05
 UPPER_RATE = 0.3
 MAX_PER_CLASS = 1500
 DIV_FACTOR = 20
-PCT_START = 0.3
-EMNIST_MEAN = (0.1736,)
-EMNIST_STD = (0.3317,)
-MEAN, STD = 0.1307, 0.3081
+IAM_MEAN = (0.8491,)
+IAM_STD = (0.2259,)
+MEAN, STD = 0.8491, 0.2259
 MATRIX_PATH = os.path.join(CHECKPOINT_FOLDER, "confusion_matrix_final")
-FINAL_MODEL_LINES_PATH = os.path.join(CHECKPOINT_FOLDER, "Final_HTR_Model_Lines.pth")
+BG_COLOR = 255
 
-""" Parametry batchowania i akumulacji gradientów na poziomie słów:
-    Głównym wąskim gardłem w module CRNN jest ekstrakcja cech oraz kosztowna 
-    pamięciowo obsługa sekwencji podczas fazy uczenia. Zastosowano fizyczny batch 4, 
-    aby pomieścić w pamięci VRAM wszystkie mapy cech niezbędne do obliczenia gradientów. 
-    Dzięki akumulacji uzyskujemy efektywny batch 64, co pozwala modelowi na przegląd
-    szerokiego spektrum stylów pisma przed aktualizacją wag. Stabilizuje to gradienty
-    i uśrednia szum wynikający z nietypowych liter. W fazie inferencji proces jest
-    błyskawiczny, ponieważ nie wymaga zapamiętywania stanów dla backpropagation. """
-BATCH_SIZE_WORDS = 4
-ACCUMULATION_STEPS = 16
+""" Ekstrakcja cech w module CRNN dla pojedynczych wyrazów opiera się na fizycznym 
+    batchu o rozmiarze 4, co optymalizuje zajętość VRAM podczas przechowywania map cech. 
+    Zastosowanie akumulacji gradientów pozwala emulować stabilny, efektywny batch o
+    rozmiarze 64. Taka konfiguracja uśrednia szum wynikający z nietypowych krojów
+    pisma i stabilizuje kierunek spadku funkcji celu CTC.
+    Później w fazie fine tune zmniejszamy do 8, co pozwala na dwukrotnie częstszą aktualizację wag. """
+BATCH_SIZE = 4
+ACCUMULATION_STEPS_MAIN = 16
+ACCUMULATION_STEPS_FINE = 8
 
-""" Parametry batchowania i akumulacji gradientów na poziomie linii:
-    Ustawienie BATCH_SIZE_LINES = 1 wynika z dużej szerokości obrazów linii oraz kosztów 
-    algorytmu Backpropagation Through Time. Przy długich sekwencjach warstwy splotowe 
-    generują ogromne mapy cech, a warstwy rekurencyjne muszą przechowywać historię stanów 
-    ukrytych dla każdej klatki czasowej w pamięci VRAM, aby wyliczyć gradienty. 
-    Poprzez ACCUMULATION_STEPS_LINES = 8 model aktualizuje wagi dopiero po zebraniu 
-    informacji z ośmiu pełnych linii. Gwarantuje to odpowiednią różnorodność stylów 
-    pisma niezbędną do stabilizacji wag i nauki długofalowych zależności sekwencyjnych. """
-BATCH_SIZE_LINES = 1
-ACCUMULATION_STEPS_LINES = 8
-
-# Gwarancja determinizmu
-SEED = 42
-random.seed(SEED)
-np.random.seed(SEED)
-torch.manual_seed(SEED)
-torch.cuda.manual_seed(SEED)
+# Gwarancja determinizmu (reszta już dzieje się w innych metodach)
 g = torch.Generator()
-g.manual_seed(SEED)
 
+""" Faza main służy budowie fundamentów wizualnych modelu. Przekazujemy zniekształcone próbki, żeby zbudował on podstawy odporności na szum,
+    zmienne oświetlenie i niedoskonałości skanów, zanim przejdzie do analizy semantycznej. W tej fazie model uczy się mapować surowe
+    piksele na stabilne reprezentacje znaków w przestrzeni cech. """
 EPOCHS_MAIN = 17
 PATIENCE_MAIN = 5
-LR_MAIN = 1e-4 # Przy 5e-5 model szybko utknął w lokalnym minimum, a 1e-4 pozwala na stabilny spadek straty osiągając ostatecznie lepszy wynik
+LR_MAIN = 2.5e-4 # Przy 5e-5 model szybko utknął w lokalnym minimum, 1e-4 to za mało, a 2.5e-4 pozwala na stabilny spadek straty osiągając ostatecznie lepszy wynik
+PCT_START = 0.15 # 3 epoki na znalezienie dobrego kierunku
 
+""" W fazie fine-tune model ma już wiedzę o ogólnych kształtach znaków i podstawowej strukturze pisma, dlatego skupia się na precyzyjnej adaptacji
+    wag do specyficznych, trudniejszych wariantów glifów oraz utrwalaniu płaskich minimów funkcji celu poprzez technikę SWA. Dzięki temu faza ta zwiększa
+    odporność modelu na drobne wahania stylu i nieznane wcześniej krzywizny znaków, co drastycznie poprawia jego zdolność generalizacji w warunkach rzeczywistych. """
 EPOCHS_FINE_TUNE = 8
 LR_FINE_TUNE = 1e-5
 
-""" W hard mining biblioteka h5py posiada własny, rygorystyczny mechanizm blokad plików i wąskie gardła I/O,
-    co spowalnia odczyt lub crashuje skrypt przy większej liczbie wątków.
-    Uzasadnienie Differential Learning Rates w fazie Hard Mining:
-    1. CNN (1e-5): Chroni bazowe filtry wizualne (krawędzie, pociągnięcia) przed szumem 
-       trudnych próbek, zapobiega katastroficznemu zapominaniu ogólnych kształtów pisma.
-       Model już powinien się dobrze nauczyć filtrów wizualnych, nie ma sensu ich dalej trenować na ciężkich próbkach.
-    2. RNN (5e-5): Pozwala na elastyczną adaptację do nietypowych ligatur i specyficznej 
-       dynamiki trudnych autorów, bez destabilizacji fundamentów optycznych.
-    3. Output (1e-4): Umożliwia najszybszą korektę granic decyzyjnych dla znaków 
-       i interpunkcji, najwyższy LR amortyzuje uderzenie wysokiego Loss na froncie modelu. """
-EPOCHS_HARD_MINING = 5
-CNN_LR = 1e-5    # Pozwalamy CNN na lekką korektę filtrów dla nowego atramentu
-RNN_LR = 5e-5    # RNN musi zaktualizować dynamikę spacji między wyrazami
-OUTPUT_LR = 1e-4 # Głowica musi szybko oduczyć się rzucania [blank]
-
+# Epoki klastrowania cech ułatwiającego pracę CapsNet
+EPOCHS_ALIGN = 3
+LR_ALIGN = 5e-6
 
 def worker_init_fn(worker_id):
     """ Każdy worker otrzymuje unikalny seed oparty na globalnym seedzie, co zapewnia różnorodność augmentacji i losowego próbkowania,
@@ -213,22 +195,20 @@ def worker_init_fn(worker_id):
     
 
 def val_process_fn(image, **kwargs):
-    """ Wrapper dla Albumentations z dynamicznym zachowaniem proporcji.
-        Zapobiega zniekształcaniu tekstu przy niestandardowych długościach. """
+    """ Wrapper dla Albumentations ze ścisłym zachowaniem naturalnych proporcji.
+        Zupełnie usuwa sztuczne limity szerokości, zapobiegając rozciąganiu i zgniataniu tekstu. """
     h_orig, w_orig = image.shape[:2]
     
     # Obliczamy proporcjonalną szerokość względem docelowej wysokości
     aspect_ratio = w_orig / h_orig
-    calculated_w = int(IMAGE_HEIGHT * aspect_ratio)
+    target_w = int(IMAGE_HEIGHT * aspect_ratio)
     
-    # Nie więcej niż LINE_WIDTH, ale też nie mniej niż WORD_WIDTH
-    target_w = min(max(calculated_w, WORD_WIDTH), LINE_WIDTH)
-    
+    # Zwracamy obraz w idealnych proporcjach - paddingiem zajmie się collate_fn
     return Preprocessing.process_for_crnn(image, target_h=IMAGE_HEIGHT, target_w=target_w)
 
 VAL_TRANSFORMS = alb.Compose([
     alb.Lambda(name="GeometricNormalization", image=val_process_fn),
-    alb.Normalize(mean=EMNIST_MEAN, std=EMNIST_STD),
+    alb.Normalize(mean=IAM_MEAN, std=IAM_STD),
     ToTensorV2()
 ])
 
@@ -247,19 +227,24 @@ def now():
     """ Zwraca aktualny czas w formacie HH:MM:SS, używany do logowania postępu treningu i debugowania. """
     return time.strftime('%H:%M:%S')
 
+
+
 class ScRN_STN(nn.Module):
     """ Symmetric Character Rectification Network oparte na TPS.
-        Automatycznie dostosowuje siatkę wyjściową do rozmiarów obrazu wejściowego,
-        zapobiegając niszczeniu proporcji krótkich słów. 
+        Automatycznie dostosowuje siatkę wyjściową do rozmiarów obrazu wejściowego, zapobiegając niszczeniu proporcji krótkich słów. 
         Najpierw Localization Network przewiduje przesunięcia punktów kontrolnych względem symetrycznych pozycji docelowych,
         Potem obliczana jest macierz TPS, a na końcu generowana jest siatka transformacji dla oryginalnych wymiarów obrazu,
-        która prostuje tekst. Dzięki temu nawet krótkie słowa zachowują swoje proporcje, a model uczy się rozpoznawać znaki bez zniekształceń. """
+        która prostuje tekst. Dzięki temu nawet krótkie słowa zachowują swoje proporcje, a model uczy się rozpoznawać znaki bez zniekształceń.
+        Uczy się razem z CRNN, przez co poprawia jakość swojej lokalizacji i prostowania tekstu na podstawie dialogu straty z CRNN. """
     def __init__(self, F=20, loc_size=(32, 64), input_channels=1):
         super(ScRN_STN, self).__init__()
         self.F = F
         self.loc_size = loc_size
         self.nc = input_channels
 
+        """ Wydobywamy z obrazu cechy przez początkową Conv2d, potem MaxPool2d redukuje wymiarowość, żeby sieć mniej zwracała
+            uwagę na dokładne położenie. Następnie aktywacja odporna na umieranie neuronów. Dodaje nieliniowość, która
+            pozwala wyciągnąć z obrazu bardziej złożone cechy. Powtarzamy dla lepszych wyników. """
         self.localization = nn.Sequential(
             nn.Conv2d(self.nc, 32, kernel_size=5),
             nn.MaxPool2d(2, stride=2),
@@ -274,6 +259,9 @@ class ScRN_STN(nn.Module):
         w_out = ((self.loc_size[1] - 4) // 2 - 4) // 2
         fc_in_features = 64 * h_out * w_out
 
+        """ Zajmuje się określaniem siły wygięcia każdego z otrzymanych punktów, najpierw liniowo mapuje do 256 liczb,
+            następnie wprowadza nieliniowość za pomocą PReLU, a na ostatnim etapie mapuje wyuczone cechy na konkretne
+            parametry geometryczne określające, w jaki sposób wyprostować obraz by stał się czytelny dla CRNN. """
         self.fc_loc = nn.Sequential(
             nn.Linear(fc_in_features, 256),
             nn.PReLU(256),
@@ -289,7 +277,7 @@ class ScRN_STN(nn.Module):
         self._build_inverse_matrix()
 
     def _build_inverse_matrix(self):
-        margin = 0.05
+        margin = 0.15
         N = self.F
 
         x_coords = torch.linspace(-1 + margin, 1 - margin, N // 2)
@@ -361,7 +349,7 @@ class ScRN_STN(nn.Module):
         source_coords = torch.matmul(grid_matrix, weights)
         grid = source_coords.view(B, H, W, 2)
 
-        transformed_img = func.grid_sample(img, grid, align_corners=True, padding_mode='border')
+        transformed_img = func.grid_sample(img, grid, align_corners=True, padding_mode='zeros')
 
         return transformed_img
 
@@ -549,16 +537,9 @@ class ResNetCRNN(nn.Module):
         super().__init__()
 
         # STN — Geometryczna Rektyfikacja
-        self.stn_word = ScRN_STN(
+        self.stn = ScRN_STN(
             F=20,
             loc_size=(32, 64),
-            input_channels=1
-        )
-
-        # STN dla długich linii (CVL/Sztuczne)
-        self.stn_line = ScRN_STN(
-            F=20,
-            loc_size=(32, 256),
             input_channels=1
         )
 
@@ -639,10 +620,7 @@ class ResNetCRNN(nn.Module):
 
     def forward(self, x, return_embeddings=False, return_context=False, return_stn=False):
         # Rektyfikacja STN
-        if x.shape[-1] > self.stn_bypass_threshold:
-            stn_img = x
-        else:
-            stn_img = self.stn(x)
+        stn_img = self.stn(x)
 
         # Ekstrakcja cech (ResNet + CRAM)
         x = self.cnn(stn_img)
@@ -800,163 +778,164 @@ class AdvancedHTRAugmentor:
         return blurred
 
     @staticmethod
-    def variable_stroke(image, **kwargs):
+    def variable_stroke(img, **kwargs):
         """ Symuluje zmienny nacisk narzędzia piszącego i różną grubość stalówki. """
-        # Konwersja na format binarny dla Distance Transform
-        if image.dtype != np.uint8:
-            image = image.astype(np.uint8)
-
-        # Biały tekst, czarne tło
-        if np.mean(image) > 127:
-            image = cv.bitwise_not(image)
-
-        dist = cv.distanceTransform(image, cv.DIST_L2, 5)
-        factor = np.random.uniform(0.8, 1.3)
-
-        # Konwertujemy dist na float32 przed mnożeniem, żeby uniknąć overflow
-        dist_float = dist.astype(np.float32)
-
-        # Bezpieczne skalowanie
-        max_val = dist_float.max()
-        if max_val > 0:
-            # Liczymy mnożnik osobno, żeby zachować precyzję
-            multiplier = factor * (255.0 / (max_val + 1e-6))
-            new_image = np.clip(dist_float * multiplier, 0, 255)
-        else:
-            new_image = dist_float
-
-        return new_image.astype(np.uint8)
-
+        # Zabezpieczenie przed pustym obrazem
+        if img is None or img.size == 0: 
+            return img
+        
+        # Jeśli obraz jest 3-kanałowy, upewnijmy się, że pracujemy na kanale jasności
+        if img.ndim == 3: 
+            img = img[:, :, 0]
+            
+        # Jeśli średnia > 127, tło jest jasne -> odwracamy, by otrzymać biały tekst na czarnym tle
+        binary = cv.bitwise_not(img) if np.mean(img) > 127 else img
+        
+        # Distance transform dla wyliczenia grubości kresek
+        dist = cv.distanceTransform(binary, cv.DIST_L2, 3)
+        
+        # Modyfikacja grubości przez potęgowanie (factor < 1.0 -> cieńsza, factor > 1.0 -> grubsza)
+        factor = np.random.uniform(0.7, 1.4)
+        dist = np.power(dist, factor)
+        
+        # Normalizacja do zakresu [0, 255] i powrót do uint8
+        cv.normalize(dist, dist, 0, 255, cv.NORM_MINMAX)
+        return dist.astype(np.uint8)
+    
     @staticmethod
     def phantom_elements(image, **kwargs):
-        """ Wymusza na sieci wizualnej ignorowanie szumu z sąsiadujących wierszy i skupienie
-            uwagi wyłącznie na głównym rdzeniu analizowanego słowa. """
-        h, w = image.shape
+        """ Wymusza na sieci wizualnej ignorowanie szumu z sąsiadujących wierszy. """
+        if image is None or image.size == 0:
+            return image
+
+        # Zabezpieczenie: jeśli obraz jest zbyt mały, pomijamy augmentację
+        h, w = image.shape[:2]
         phantom_h = int(h * 0.15)
+        if phantom_h < 2:
+            return image
+
         phantom = np.zeros((phantom_h, w), dtype=np.uint8)
         for _ in range(random.randint(1, 2)):
-            x = random.randint(0, max(0, w-30))
-            cv.ellipse(phantom, (x, phantom_h), (random.randint(5, 12), 4), random.randint(0, 30), 0, 360, (255, -1))
+            x = random.randint(0, max(0, w - 30))
+            cv.ellipse(phantom, (x, phantom_h), (random.randint(5, 12), 4), 
+                       random.randint(0, 30), 0, 360, (255), -1)
+
+        # Obliczenie rzeczywistej wysokości do wklejenia (zabezpieczenie przed index out of bounds)
+        actual_ph = min(phantom_h, h)
+        
         if random.random() > 0.5:
-            image[:phantom_h, :] = cv.bitwise_or(image[:phantom_h, :], phantom)
+            image[:actual_ph, :] = cv.bitwise_or(image[:actual_ph, :], phantom[:actual_ph, :])
         else:
-            image[-phantom_h:, :] = cv.bitwise_or(image[-phantom_h:, :], np.flipud(phantom))
+            image[-actual_ph:, :] = cv.bitwise_or(image[-actual_ph:, :], np.flipud(phantom[:actual_ph, :]))
+            
         return image
+    
+    @staticmethod
+    def create_realistic_space(height, width):
+        """ Zastępuje idealnie czarną próżnię zaszumionym tłem charakterystycznym dla skanów. """
+        if width <= 0:
+            return np.zeros((height, 1), dtype=np.uint8)
+        # Tworzymy delikatny szum o niskiej amplitudzie, który imituje fakturę papieru
+        base_bg = np.random.randint(0, 18, (height, width), dtype=np.uint8)
+        
+        # Rozmywamy, aby przypominało fakturę papieru, a nie cyfrowy szum
+        return cv.GaussianBlur(base_bg, (3, 3), 0)
 
 
 class IAMWordDataset(Dataset):
     """ Moduł ładujący zbiór IAM Words ze wsparciem dla dynamicznego skalowania z zachowaniem proporcji.
         Wszystkie dane (obrazy i etykiety) są dekodowane i wczytywane bezpośrednio do pamięci RAM
         podczas inicjalizacji obiektu, co drastycznie przyspiesza proces treningu kosztem pamięci operacyjnej. """
-    def __init__(self, h5_path, transform, char_list, name="Główny", split='train', existing_cache=None, existing_labels=None):
+    def __init__(self, h5_path, transform, char_list, name="Główny", split='train'):
         self.h5_path = h5_path
         self.transform = transform
-        self.char_list = char_list
-        self.dictionary = char_list
+        self.dictionary = set(char_list)
         self.name = name
         self.split = split
         self.IMAGE_HEIGHT = 64
-
-        # Zdefiniowanie pustych list na próbki
         self.valid_indices = []
         self.valid_labels = []
         self.h5_file = None
+        self.images_group_path = 'images'
 
-        with h5py.File(self.h5_path, 'r', swmr=True) as f:
-            raw_labels = f[self.split]['labels'][:]
+        with h5py.File(self.h5_path, 'r') as f:
+            # Sprawdzamy czy plik ma strukturę /train/ i /val/
+            if self.split in f:
+                # Plik ma strukturę, używamy dedykowanych grup!
+                target_group = f[self.split]
+                labels = target_group['labels'][:]
+                self.images_group_path = f"{self.split}/images"
+                indices = range(len(labels)) # Używamy indeksów bezpośrednio z grupy
+                tqdm.write(f"[{now()}] Wykryto strukturę H5. Używam grupy: {self.split}")
+            else:
+                # Plik jest płaski, musimy dzielić sami
+                labels = f['labels'][:]
+                total = len(labels)
+                np.random.seed(42)
+                indices = np.random.permutation(total)
+                train_cutoff = int(0.9 * total)
+                indices = indices[:train_cutoff] if self.split == 'train' else indices[train_cutoff:]
+                tqdm.write(f"[{now()}] Plik płaski. Stosuję manualny split.")
 
-            for i, lbl in enumerate(raw_labels):
+            # Filtracja
+            for i in indices:
+                lbl = labels[i]
                 text = lbl.decode('utf-8') if isinstance(lbl, bytes) else str(lbl)
-                text = text.strip()
+                text = re.sub(r'[\x00-\x1f\x7f-\x9f]', '', text).strip()
+                
+                # Czyszczenie sufiksów IAM
+                text = re.sub(r'_\d+$', '', text) 
+                text = re.sub(r'-\d+$', '', text)
+                
                 if text and all(c in self.dictionary for c in text):
                     self.valid_indices.append(i)
-                    self.valid_labels.append(text) # <-- POPRAWKA: Zapisujemy do poprawnej listy
+                    self.valid_labels.append(text)
 
         self.dataset_len = len(self.valid_indices)
-        tqdm.write(f" Zainicjalizowano {self.name}: {self.dataset_len} próbek.")
-
-    def _decode_and_preprocess(self, idx):
-        """ Funkcja ładuje, dekoduje i przetwarza pojedynczą próbkę. """
-        try:
-            # Pobieranie danych z pliku HDF5
-            with h5py.File(self.h5_path, 'r', swmr=True) as f:
-                raw_img = f[self.split]['images'][idx]
-                raw_label = self.labels[idx]
-
-            # Dekodowanie i wstępna weryfikacja etykiety
-            label_text = raw_label.decode('utf-8') if isinstance(raw_label, bytes) else str(raw_label)
-            label_text = label_text.strip()
-
-            # Odrzucamy puste etykiety lub te ze znakami spoza zdefiniowanego słownika
-            if not label_text or not all(c in self.dictionary for c in label_text):
-                return None
-
-            # Dekodowanie obrazu (obsługa formatu skompresowanego lub surowych macierzy)
-            if isinstance(raw_img, np.ndarray) and raw_img.ndim == 1:
-                img = cv.imdecode(raw_img, cv.IMREAD_GRAYSCALE)
-            else:
-                img = raw_img
-
-            if img is None or img.size == 0:
-                return None
-
-            # Inwersja kolorów
-            if np.mean(img) > 127:
-                img = cv.bitwise_not(img)
-
-            # Skalowanie z zachowaniem proporcji
-            h, w = img.shape[:2]
-            scale = self.IMAGE_HEIGHT / max(1, h)
-            
-            # Obliczamy nową szerokość:
-            # $$new\_w = \max(16, \text{int}(w \cdot scale))$$
-            new_w = max(16, int(w * scale))
-
-            # Szerokość obrazu musi być proporcjonalna do długości tekstu
-            min_w_needed = len(label_text) * 16
-            new_w = max(new_w, min_w_needed)
-
-            img = cv.resize(img, (new_w, self.IMAGE_HEIGHT), interpolation=cv.INTER_AREA)
-
-            # Zwracamy spójną krotkę gotową do użycia w treningu
-            return np.ascontiguousarray(img, dtype=np.uint8), label_text
-
-        except (cv.error, UnicodeDecodeError, TypeError, ValueError, KeyError) as e:
-            # W przypadku jakiegokolwiek błędu zwracamy None, co pozwoli loaderowi pominąć tę próbkę
-            return None
+        tqdm.write(f"[{now()}] Zainicjalizowano {self.name}: {self.dataset_len} próbek.")
         
     def __getitem__(self, idx):
         h5_idx = self.valid_indices[idx]
         label = self.valid_labels[idx]
         
-        # Leniwe otwieranie pliku - tylko raz dla danego procesu
-        if getattr(self, 'h5_file', None) is None:
-            self.h5_file = h5py.File(self.h5_path, 'r', swmr=True)
-
-        # Odczyt bezpośrednio z trzymanego w pamięci otwartego uchwytu
-        img_data = self.h5_file[self.split]['images'][h5_idx]
-
-        if isinstance(img_data, np.ndarray) and img_data.ndim == 1:
-            img = cv.imdecode(img_data, cv.IMREAD_GRAYSCALE)
+        # Ładowanie
+        img = self._load_single_h5_image(h5_idx)
+        
+        # Sprawdzenie czy w ogóle mamy obraz (2D) i czy nie jest pusty
+        if img is None or img.ndim < 2 or img.size == 0:
+            img = np.zeros((self.IMAGE_HEIGHT, 64), dtype=np.uint8)
         else:
-            img = img_data
+            # Inwersja kolorów
+            if np.mean(img) > 127:
+                img = cv.bitwise_not(img)
 
-        if img is None or img.size == 0:
+            # Bezpieczne kadrowanie
+            coords = cv.findNonZero(img)
+            if coords is not None and coords.shape[0] > 0:
+                x, y, w_bbox, h_bbox = cv.boundingRect(coords)
+                # Sprawdzamy czy wykryto sensowny rozmiar
+                if w_bbox > 1 and h_bbox > 1:
+                    pad = int(h_bbox * 0.1)
+                    x1 = max(0, x - pad)
+                    # Używamy min/max aby uniknąć błędów indeksowania
+                    x2 = min(img.shape[1], x + w_bbox + pad)
+                    img = img[:, x1:x2]
+
+        # Sprawdzenie kształtu przed resize
+        if img.ndim < 2 or img.shape[0] == 0 or img.shape[1] == 0:
             img = np.zeros((self.IMAGE_HEIGHT, 64), dtype=np.uint8)
 
-        if np.mean(img) > 127: 
-            img = cv.bitwise_not(img)
-
-        # Skalowanie
+        # Skalowanie z zabezpieczeniem przed dzieleniem przez 0
         h, w = img.shape[:2]
         scale = self.IMAGE_HEIGHT / max(1, h)
-        new_w = max(16, int(w * scale))
-        min_w_needed = len(label) * 16  # Bezpieczeństwo pod CTC
-        img = cv.resize(img, (max(new_w, min_w_needed), self.IMAGE_HEIGHT), interpolation=cv.INTER_AREA)
+        new_w = max(16, int(w * scale)) 
+        
+        # Resize
+        img = cv.resize(img, (new_w, self.IMAGE_HEIGHT), interpolation=cv.INTER_AREA)
 
+        # Transformacje
         augmented = self.transform(image=img)
-        category = 'short' if len(label) < 5 else 'medium' if len(label) < 10 else 'long'
-        return augmented['image'], label, category, "disk"
+        return augmented['image'], label
         
     def get_text(self, idx):
         """ Zwraca tekst dla danego indeksu """
@@ -972,111 +951,32 @@ class IAMWordDataset(Dataset):
 
         # Jeśli nie wiemy co to za zbiór, zwracamy pusty ciąg, by nie wywalać błędu
         return ""
+    
+    def _get_h5_file(self):
+        # Otwieramy plik tylko, jeśli jeszcze nie jest otwarty w tym procesie
+        if self.h5_file is None:
+            self.h5_file = h5py.File(self.h5_path, 'r')
+        return self.h5_file
+
+    def _load_single_h5_image(self, h5_idx):
+        f = self._get_h5_file()
+        data = f[self.images_group_path][h5_idx]
+        nparr = np.frombuffer(data, np.uint8)
+        img = cv.imdecode(nparr, cv.IMREAD_GRAYSCALE)
+    
+        if img is None:
+            return np.zeros((64, 64), dtype=np.uint8)
+        return img
+
+    def __del__(self):
+        try:
+            if hasattr(self, 'h5_file') and self.h5_file is not None:
+                self.h5_file.close()
+        except:
+            pass # Ignorujemy błędy przy zamykaniu, jeśli obiekt już nie istnieje
 
     def __len__(self):
         return self.dataset_len
-
-
-class CVLLineDataset(Dataset):
-    """ Zestaw danych dla linii tekstu z bazy CVL.
-        Wersja Lazy Loading: wczytuje obrazy z dysku/H5 tylko podczas treningu,
-        co drastycznie oszczędza RAM. """
-    def __init__(self, h5_path, transform, char_list, split='train'):
-        self.h5_path = h5_path
-        self.transform = transform
-        self.char_list = char_list
-        self.dictionary = set(char_list)
-        self.split = split
-        self.IMAGE_HEIGHT = 64
-        self.MAX_WIDTH = 2048
-
-        if not os.path.exists(self.h5_path):
-            raise FileNotFoundError(f"Nie znaleziono pliku H5: {self.h5_path}")
-
-        self.valid_indices = []
-        self.valid_labels = []
-        self.h5_file = None
-
-        with h5py.File(self.h5_path, 'r', swmr=True) as f:
-            if self.split not in f:
-                raise KeyError(f"Sekcja '{self.split}' nie istnieje w pliku H5.")
-
-            raw_labels = f[self.split]['labels'][:]
-
-            tqdm.write(f"[{time.strftime('%H:%M:%S')}] Filtrowanie linii CVL {self.split}.")
-
-            for i, lbl in enumerate(raw_labels):
-                if isinstance(lbl, bytes):
-                    lbl = lbl.decode('utf-8')
-
-                # Filtr języka
-                if "-de-" in lbl.lower():
-                    continue
-
-                # Czyszczenie i filtr znaków
-                lbl_clean = lbl.replace('_', ' ').strip()
-                if lbl_clean and all(c in self.dictionary for c in lbl_clean):
-                    self.valid_indices.append(i)
-                    self.valid_labels.append(lbl_clean)
-
-        self.dataset_len = len(self.valid_labels)
-        tqdm.write(f"[{time.strftime('%H:%M:%S')}] Załadowano {self.dataset_len} linii CVL (Lazy Mode).")
-
-    def __getitem__(self, idx):
-        h5_idx = self.valid_indices[idx]
-        label = self.get_text(idx)
-        
-        # Leniwe otwieranie pliku - tylko raz dla danego procesu
-        if getattr(self, 'h5_file', None) is None:
-            self.h5_file = h5py.File(self.h5_path, 'r', swmr=True)
-
-        # Odczyt bezpośrednio z trzymanego w pamięci otwartego uchwytu
-        img_data = self.h5_file[self.split]['images'][h5_idx]
-
-        if isinstance(img_data, np.ndarray) and img_data.ndim == 1:
-            img = cv.imdecode(img_data, cv.IMREAD_GRAYSCALE)
-        else:
-            img = img_data
-
-        if img is None or img.size == 0:
-            img = np.zeros((self.IMAGE_HEIGHT, 64), dtype=np.uint8)
-
-        # Inwersja (jeśli tło jasne)
-        if np.mean(img) > 127:
-            img = cv.bitwise_not(img)
-
-        # Kadrowanie pustego tła pionowego przed skalowaniem, żeby wypełniło całe tło
-        coords = cv.findNonZero(img)
-        if coords is not None:
-            x, y, w_bbox, h_bbox = cv.boundingRect(coords)
-            # Zostawiamy mały margines (np. 5 pikseli)
-            y1 = max(0, y - 5)
-            y2 = min(img.shape[0], y + h_bbox + 5)
-            img = img[y1:y2, :]
-
-        # Skalowanie z zachowaniem proporcji
-        h, w = img.shape[:2]
-        scale = self.IMAGE_HEIGHT / max(1, h)
-        new_w = int(w * scale)
-
-        # Zabezpieczenie CTC (szerokość musi być min. 24x większa od liczby znaków dla linii)
-        min_width_for_ctc = len(label) * 24
-        new_w = max(new_w, min_width_for_ctc)
-        if new_w > self.MAX_WIDTH:
-            new_w = self.MAX_WIDTH
-
-        img = cv.resize(img, (new_w, self.IMAGE_HEIGHT), interpolation=cv.INTER_LANCZOS4)
-
-        # Augmentacja (wykonywana w locie na CPU)
-        augmented = self.transform(image=img)
-
-        return augmented['image'], label, 'line', 'disk_source'
-
-    def __len__(self):
-        return self.dataset_len
-        
-    def get_text(self, idx):
-        return self.valid_labels[idx]
 
 
 class WidthBatchSampler(Sampler):
@@ -1105,70 +1005,30 @@ class WidthBatchSampler(Sampler):
         return (len(self.sorted_indices) + self.batch_size - 1) // self.batch_size
 
 
-class CharLabelEncoder:
-    """ Klasa odpowiedzialna za konwersję między znakami tekstowymi a ich indeksami rozszerzona o język polski. """
-    def __init__(self):
-        polish_chars = "ąćęłńóśźżĄĆĘŁŃÓŚŹŻ" # Dodajemy polskie znaki diakrytyczne (18 znaków)
-        raw_chars = " !\'(),-.:;?0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz" + polish_chars
-
-        self.char_list = ['[blank]'] + sorted(list(raw_chars))
-        self.idx_to_char = {i: c for i, c in enumerate(self.char_list)}
-        self.char_to_idx = {c: i for i, c in enumerate(self.char_list)}
-
-    def encode(self, char):
-        """ Zwraca indeks dla pojedynczego znaku (używane przy PHCF). """
-        return self.char_to_idx.get(char)
-
-    def encode_sequence(self, text):
-        """ Konwertuje napis na listę indeksów (używane przy IAM Words). """
-        return [self.char_to_idx[c] for c in text if c in self.char_to_idx]
-
-    def decode(self, idx_seq, ignore_blanks=True):
-        """ Dekoduje indeksy na tekst. Obsługuje zarówno pojedyncze liczby, jak i sekwencje. """
-        # Jeśli dostaliśmy pojedynczy int, po prostu zwróć odpowiadający mu znak
-        if isinstance(idx_seq, int):
-            return self.idx_to_char.get(idx_seq, '?')
-
-        # Jeśli to Tensor, zamień na listę
-        if isinstance(idx_seq, torch.Tensor):
-            # Jeśli Tensor jest skalarem (0-wymiarowy)
-            if idx_seq.dim() == 0:
-                return self.idx_to_char.get(idx_seq.item(), '?')
-            idx_seq = idx_seq.tolist()
-
-        # Logika dla sekwencji (np. wyjście z CRNN)
-        res = []
-        for i, idx in enumerate(idx_seq):
-            char = self.idx_to_char.get(idx, '')
-            if char == '[blank]' and ignore_blanks:
-                continue
-            # Logika CTC: pomijaj powtórzenia znaków obok siebie
-            if i > 0 and idx == idx_seq[i - 1]:
-                continue
-            res.append(char)
-
-        return "".join(res)
-
-    def get_num_classes(self):
-        return len(self.char_list)
-
-
 class HTREncoder:
     """ Słownik i dekoder HTR. Obsługuje CTC Blank, Spacje, Entropię Shannona oraz Beam Search z LM. """
     # Stała interpunkcyjna używana w Visual Veto
     PUNCT_TO_GUARD = ('.', ',', '!', '?', ':', ';', "'", ')')
 
     def __init__(self, char_list: List[str]):
-        self.char_list = char_list 
+        # Wymuszamy, aby '[blank]' był zawsze pod indeksem 0, a spacja zachowała swój indeks
+        self.char_list = ['[blank]'] + [c for c in char_list if c != '[blank]']
 
-        self.char_to_num = {c: i + 1 for i, c in enumerate(self.char_list)}
-        self.num_to_char = {i + 1: c for i, c in enumerate(self.char_list)}
-        self.num_to_char[0] = ''
-        self.char_to_num[''] = 0
+        self.char_to_num = {c: i for i, c in enumerate(self.char_list)}
+        self.num_to_char = {i: c for i, c in enumerate(self.char_list)}
 
     def get_num_classes(self) -> int:
-        """ Zwraca liczbę klas wyjściowych (alfabet + blank). """
-        return len(self.char_list) + 1
+        return len(self.char_list)
+
+    def labels_to_text(self, indices: Union[List[int], np.ndarray]) -> str:
+        """ Konwertuje listę indeksów na tekst, czyszcząc techniczne nazwy znaków. """
+        res = []
+        for idx in indices:
+            idx_int = int(idx)
+            if idx_int != 0:  # 0 to [blank], ignorujemy w tekście końcowym
+                char_raw = self.num_to_char.get(idx_int, '')
+                res.append(self.clean_char(char_raw))
+        return "".join(res)
 
     @staticmethod
     def clean_char(char_raw: str) -> str:
@@ -1181,30 +1041,19 @@ class HTREncoder:
         return mapping.get(str(char_raw).lower(), char_raw)
 
     @staticmethod
-    def calculate_uncertainty(logits: torch.Tensor) -> float:
-        """ Oblicza średnią entropię Shannona dla sekwencji. Stabilna wersja wykorzystująca log_softmax. """
-        # Używamy log_softmax zamiast softmax + log dla stabilności numerycznej
-        log_probs = torch.log_softmax(logits, dim=-1)
+    def calculate_uncertainty(logits: torch.Tensor, temperature: float = 2.0) -> float:
+        """ Oblicza średnią entropię Shannona dla sekwencji wykorzystując Temperature Scaling. """
+        scaled_logits = logits / temperature
+        log_probs = torch.log_softmax(scaled_logits, dim=-1)
         probs = torch.exp(log_probs)
 
-        # Entropia Shannona: H(X) = -sum(p * log2(p) na log naturalny
+        # Entropia Shannona
         entropy = -torch.sum(probs * (log_probs / math.log(2)), dim=-1)
         return torch.mean(entropy).item()
 
-    def labels_to_text(self, indices: Union[List[int], np.ndarray]) -> str:
-        """ Konwertuje listę indeksów na tekst. """
-        res = []
-        for idx in indices:
-            if idx != 0:  # Ignorujemy CTC Blank
-                char_raw = self.num_to_char.get(int(idx), '')
-                res.append(self.clean_char(char_raw))
-        return "".join(res)
-
     def decode_greedy(self, log_probs: torch.Tensor) -> Tuple[List[str], List[float]]:
-        """ Dekodowanie zachłanne z ekstrakcją entropii. """
-        # Upewniamy się, że wymiary to [Batch, Time, Class]
+        """ Dekodowanie zachłanne z ekstrakcją entropii i bez przesunięć indeksów. """
         if log_probs.dim() == 3:
-            # Jeśli Time jest większe od Batch, lub jeśli Batch jest równy 1 (co często zdarza się przy testowaniu pojedynczych próbek)
             if log_probs.shape[0] > log_probs.shape[1] or log_probs.shape[1] == 1:
                 log_probs = log_probs.permute(1, 0, 2)
 
@@ -1220,7 +1069,6 @@ class HTREncoder:
             last_idx = -1
 
             for idx in row:
-                # Logika CTC: pomiń blanki i powtórzenia bez separatora
                 if idx != 0 and idx != last_idx:
                     collapsed_indices.append(idx)
                 last_idx = idx
@@ -1234,27 +1082,20 @@ class HTREncoder:
         return decoded_list, uncertainty_list
 
     def decode_beam_search(self, log_probs: torch.Tensor, lm_decoder, beam_width: int = 64, temperature: float = 1.4) -> List[str]:
-        """ Zoptymalizowane dekodowanie Beam Search z hybrydowym mechanizmem Visual Veto. Rozwiązuje problem
-            halucynacji LM przy zachowaniu polskich znaków diakrytycznych. """
-        # Upewniamy się, że format to [Time, Batch, Class] przed wejściem do algorytmu
+        """ Zoptymalizowane dekodowanie Beam Search z hybrydowym mechanizmem Visual Veto. """
         if log_probs.dim() == 3:
-            # Jeśli Batch jest pierwszy (T > B lub B == 1)
             if log_probs.shape[0] < log_probs.shape[1] or log_probs.shape[0] == 1:
                 log_probs = log_probs.permute(1, 0, 2)
 
-        # Skalowanie i kara za blanki
         scaled_log_probs = log_probs.clone() / temperature
-        scaled_log_probs[:, :, 0] -= 1.2  
+        scaled_log_probs[:, :, 0] -= 1.2  # Lekka kara dla blanka na indeksie 0
 
-        # Konwersja do prawdopodobieństw i powrót na (Batch, Time, Class) do iteracji
         probs = torch.softmax(scaled_log_probs, dim=-1).permute(1, 0, 2).cpu().numpy()
         decoded_texts = []
 
         for i in range(probs.shape[0]):
-            # Odczyt z Modelu Językowego - sugeruje najbardziej prawdopodobne słowo
             text_lm = lm_decoder.decode(probs[i], beam_width=beam_width).strip()
 
-            # Surowy odczyt wizualny
             raw_indices = np.argmax(probs[i], axis=-1)
             text_raw = self.decode(raw_indices)
 
@@ -1262,20 +1103,14 @@ class HTREncoder:
                 decoded_texts.append(text_lm if text_lm else "")
                 continue
 
-            # Mechanizm Visual Veto (jeśli pewny to wierzymy jemu, nie słownikowi)
             dist = edit_distance(text_raw, text_lm)
             norm_dist = dist / len(text_raw)
 
-            # LM usuwa interpunkcję, którą model optyczny widzi wyraźnie
             last_char_raw = text_raw[-1]
             if last_char_raw in ".,!?:;()-\" '/" and not text_lm.endswith(last_char_raw):
                 final_word = text_raw
-
-            # LM halucynuje zupełnie inne słowo albo drastycznie skraca bardzo krótkie słowa
             elif norm_dist > 0.45 or (3 >= len(text_raw) > len(text_lm)):
                 final_word = text_raw
-
-            # Standardowa poprawka językowa
             else:
                 final_word = text_lm if text_lm else text_raw
 
@@ -1284,7 +1119,7 @@ class HTREncoder:
         return decoded_texts
 
     def encode_text(self, text_list: List[str]) -> Tuple[torch.Tensor, torch.Tensor]:
-        """ Zamienia listę tekstów na tensor indeksów i długości (pod CTCLoss). """
+        """ Zamienia listę tekstów na tensor indeksów i długości (Zsynchronizowane z CTCLoss). """
         targets = []
         lengths = []
         for text in text_list:
@@ -1294,7 +1129,7 @@ class HTREncoder:
         return torch.tensor(targets, dtype=torch.long), torch.tensor(lengths, dtype=torch.long)
 
     def decode(self, idx_seq: Union[List[int], torch.Tensor]) -> str:
-        """ Proste dekodowanie pojedynczej sekwencji indeksów. """
+        """ Dekodowanie pojedynczego wektora indeksów (Greedy Fallback). """
         if isinstance(idx_seq, torch.Tensor):
             idx_seq = idx_seq.tolist()
 
@@ -1340,6 +1175,7 @@ def get_emnist_char_list_byclass() -> list:
     return [chr(i) for i in range(48, 58)] + [chr(i) for i in range(65, 91)] + [chr(i) for i in range(97, 123)]
 
 
+
 def get_augmentations(phase):
     """ Przekazuje do CRNN augmentacje odpowiednie dla danego etapu uczenia. """
     if phase == "main":
@@ -1380,7 +1216,7 @@ def get_augmentations(phase):
             ], p=0.3),
 
             # Standaryzacja do eMNIST
-            alb.Normalize(mean=EMNIST_MEAN, std=EMNIST_STD),
+            alb.Normalize(mean=IAM_MEAN, std=IAM_STD),
             ToTensorV2()
         ])
 
@@ -1409,7 +1245,7 @@ def get_augmentations(phase):
             alb.RandomBrightnessContrast(brightness_limit=0.1, contrast_limit=0.1, p=0.2),
 
             # Standaryzacja do eMNIST
-            alb.Normalize(mean=EMNIST_MEAN, std=EMNIST_STD),
+            alb.Normalize(mean=IAM_MEAN, std=IAM_STD),
             ToTensorV2()
         ])
     return None
@@ -1438,31 +1274,46 @@ def get_label_from_filename(filename):
 
 
 def create_balanced_sampler(dataset, alphabet):
-    """ Tworzy WeightedRandomSampler wyliczając wagi na podstawie uśrednionej rzadkości znaków w danej sekwencji tekstowej. """
-    # Bezpieczne pobieranie tekstów z uwzględnieniem połączonych zbiorów (ConcatDataset)
-    all_texts = []
-    if isinstance(dataset, ConcatDataset):
-        for ds in dataset.datasets:
-            # Pobieramy teksty bezpiecznie
-            for i in range(len(ds)):
-                text = ds.get_text(i)
-                # Jeśli z jakiegoś powodu tekst jest pusty, dajemy znak z alfabetu
-                all_texts.append(text if text else alphabet[0])
-    else:
-        all_texts = [dataset.get_text(i) for i in range(len(dataset))]
+    """ Tworzy WeightedRandomSampler z bezpiecznym pobieraniem tekstów z opakowanych zbiorów. """
+    def get_text_recursive(ds, idx):
+        # Obsługa Subset
+        if isinstance(ds, Subset):
+            # Przekierowujemy indeks na oryginalny zbiór
+            return get_text_recursive(ds.dataset, ds.indices[idx])
         
+        # Obsługa ConcatDataset
+        elif isinstance(ds, ConcatDataset):
+            # Znajdujemy, w którym pod-zbiorze znajduje się indeks
+            for i, end_idx in enumerate(ds.cumulative_sizes):
+                if idx < end_idx:
+                    # Obliczamy lokalny indeks wewnątrz pod-zbioru
+                    local_idx = idx - (ds.cumulative_sizes[i-1] if i > 0 else 0)
+                    return get_text_recursive(ds.datasets[i], local_idx)
+        
+        # Jeśli dotarliśmy do źródła (IAMWordDataset lub PolishSyntheticDataset)
+        elif hasattr(ds, 'get_text'):
+            return ds.get_text(idx)
+        
+        return alphabet[0]
+
+    # Pobieranie wszystkich tekstów
+    all_texts = []
+    for i in range(len(dataset)):
+        text = get_text_recursive(dataset, i)
+        all_texts.append(text if text else alphabet[0])
+                
+    # Logika wag
     char_counts = {char: 0 for char in alphabet}
     for text in all_texts:
         for char in text:
             if char in char_counts:
                 char_counts[char] += 1
                 
-    # Waga znaku: $W_c = \frac{1}{count + 10^{-5}}$
+    # Waga znaku
     char_weights = {char: 1.0 / (count + 1e-5) for char, count in char_counts.items()}
     
     sample_weights = []
     for text in all_texts:
-        # Waga słowa to średnia waga jego znaków
         weight = sum(char_weights.get(c, 0) for c in text) / max(len(text), 1)
         sample_weights.append(weight)
         
@@ -1471,12 +1322,18 @@ def create_balanced_sampler(dataset, alphabet):
 
 
 def collate_fn_dynamic(batch):
-    """ Składa próbki w batch, stosując inteligentny padding i bezpieczne ucinanie. """
+    """ Składa próbki w batch, stosując w pełni dynamiczny padding bez ucinania długich słów. """
     batch = [item for item in batch if item is not None]
     if len(batch) == 0: return None
 
-    # Walidacja batcha
-    valid_batch = [item for item in batch if torch.is_tensor(item[0]) and item[0].dim() == 3]
+    # Walidacja batcha + Odrzucenie próbek ze spacją
+    valid_batch = []
+    for item in batch:
+        if torch.is_tensor(item[0]) and item[0].dim() == 3:
+            label = item[1]
+            if ' ' not in label: 
+                valid_batch.append(item)
+                
     if not valid_batch: return None
 
     imgs = [item[0] for item in valid_batch]
@@ -1484,40 +1341,42 @@ def collate_fn_dynamic(batch):
     categories = [item[2] if len(item) > 2 else 'short' for item in valid_batch]
     extras = list(zip(*[item[3:] for item in valid_batch])) if any(len(item) > 3 for item in valid_batch) else []
 
-    is_line_batch = ('line' in categories)
-    current_limit = LINE_WIDTH if is_line_batch else WORD_WIDTH
+    # Obliczamy wartość tła do paddingu
+    bg_val = (0.0 - float(IAM_MEAN[0])) / float(IAM_STD[0])
 
-    # Przetwarzamy obrazy pojedynczo
+    # Przetwarzamy obrazy
     processed_imgs = []
     for img, label in zip(imgs, labels):
         current_w = int(img.shape[-1])
 
-        # Ustalenie mnożnika szerokości dla bezpieczeństwa CTC
-        multiplier = 48 if is_line_batch else 32
-        min_w_needed = len(label) * multiplier
+        # Zabezpieczenie dla CTC: CRNN redukuje wymiary. Obraz musi mieć fizycznie miejsce na wyplucie wszystkich znaków.
+        min_w_needed = len(label) * 16
 
-        # Bezpieczny limit szerokości
-        safe_limit = max(current_limit, min_w_needed)
+        # Jeśli obraz jest skrajnie nienaturalnie ściśnięty, rozszerzamy go od razu
+        if current_w < min_w_needed:
+            pad_right = min_w_needed - current_w
+            img = torch.nn.functional.pad(img, (0, pad_right), value=bg_val)
+            current_w = min_w_needed
 
-        # Jeśli obraz przekracza limit, ucinamy
-        if current_w > safe_limit:
-            img = img[:, :, :safe_limit]
-            current_w = safe_limit
+        # Zakładam, że 2048 to cała linia
+        if current_w > 2048:
+            img = img[:, :, :2048]
 
         processed_imgs.append(img)
 
-    # Obliczamy max_w dla tego konkretnego batcha
+    # Szukamy najszerszego słowa w tym batchu
     batch_max_w = max(int(img.shape[-1]) for img in processed_imgs)
 
-    # Normalizacja tła
-    bg_val = (0.0 - float(EMNIST_MEAN[0])) / float(EMNIST_STD[0])
+    """ Zapisujemy informacje o oryginalnej szerokości przed nałożeniem paddingu. Dzięki temu funkcja CTC Loss wie,
+        w którym dokładnie miejscu kończy się rzeczywisty tekst, a zaczyna pusta przestrzeń, co zapobiega zdominowaniu modelu przez spacje. """
+    original_widths = [int(img.shape[-1]) for img in processed_imgs]
 
     padded_imgs = []
     for img in processed_imgs:
         curr_w = int(img.shape[-1])
-        pad_right = int(batch_max_w - curr_w)
+        pad_right = batch_max_w - curr_w
 
-        # Padding do prawej krawędzi
+        # Wyrównanie wszystkich słów do prawej krawędzi (do najdłuższego w batchu)
         if pad_right > 0:
             padded_img = torch.nn.functional.pad(img, (0, pad_right), value=bg_val)
         else:
@@ -1529,11 +1388,11 @@ def collate_fn_dynamic(batch):
     if extras:
         return padded, labels, categories, *[list(field) for field in extras]
 
-    return padded, labels, categories
+    return padded, labels, categories, original_widths
 
 
 def label_smoothed_ctc_loss(log_probs, targets, input_lengths, target_lengths, smoothing=0.0, reduction='none'):
-    """ CTC Loss z opcjonalnym label smoothing dla lepszej kalibracji modelu. """
+    """ CTC Loss z opcjonalnym label smoothing dla lepszej kalibracji modelu. W fazie fine-tune. """
     raw_loss = nn.CTCLoss(blank=0, zero_infinity=True, reduction='none')(
         log_probs, targets, input_lengths, target_lengths
     )
@@ -1650,107 +1509,36 @@ def focal_ace_loss(log_probs, targets, input_lengths, target_lengths, gamma=2.0,
     return focal_weighted
 
 
-class CenterLoss(nn.Module):
-    """ Center Loss dla lepszej separacji cech między klasami.
-        Kluczowe dla pipeline CRNN → CapsNet:
-        - Tworzy dobrze rozdzielone clustry dla każdego znaku w przestrzeni cech.
-        - CapsNet dostaje lepsze embeddingi do routingu.
-        - Redukuje confusion między podobnymi znakami (l/I, 0/O, etc.) """
-    def __init__(self, num_classes, feat_dim, device):
-        super().__init__()
-        self.num_classes = num_classes
-        self.feat_dim = feat_dim
-        self.device = device
-
-        # Centra klas — uczą się podczas treningu
-        self.centers = nn.Parameter(torch.randn(num_classes, feat_dim).to(device))
-
-    def forward(self, features, labels):
-        batch_size = features.size(0)
-
-        # Odległości od centrów
-        distmat = torch.pow(features, 2).sum(dim=1, keepdim=True).expand(batch_size, self.num_classes) + \
-                  torch.pow(self.centers, 2).sum(dim=1, keepdim=True).expand(self.num_classes, batch_size).t()
-        distmat.addmm_(features, self.centers.t(), beta=1, alpha=-2)
-
-        # Wybieramy odległość od właściwego centrum dla każdego sample
-        classes = torch.arange(self.num_classes, device=self.device).long()
-        labels_expand = labels.unsqueeze(1).expand(batch_size, self.num_classes)
-        mask = labels_expand.eq(classes.expand(batch_size, self.num_classes))
-
-        dist = distmat * mask.float()
-        loss = dist.clamp(min=1e-12, max=1e+12).sum() / batch_size
-
-        return loss
-
-
-def focal_ctc_loss(log_probs, targets, input_lengths, target_lengths, gamma=2.0, smoothing=0.0, reduction='mean', truncation_threshold=0.01):
-    """ Strata fokalna z mechanizmem obcinania (Truncation). Zapobiega skupianiu się modelu na próbkach
-    	niemożliwych do odczytania (ze względu na mnogość augmentacji, ciężko nad tym zapanować). """
+def focal_ctc_loss(log_probs, targets, input_lengths, target_lengths, gamma=2.0, reduction='mean'):
+    """ Strata fokalna zmusza sieć do ignorowania rzeczy, które już potrafi, i skupienia 100% swojej
+        uwagi na przypadkach, z którymi sobie nie radzi. """
     device = log_probs.device
     raw_loss = torch.nn.CTCLoss(blank=0, zero_infinity=True, reduction='none')(
         log_probs, targets, input_lengths, target_lengths
     )
 
     norm_loss = raw_loss / target_lengths.to(device).clamp(min=1).float()
-
+    
     # Prawdopodobieństwo 'p' wyliczone z normalizowanej straty
     p = torch.exp(-norm_loss)
     
-    # Jeśli p < truncation_threshold, ograniczamy wpływ tej próbki - mechanizm obcinania
+    # Standardowy mnożnik fokalny bez ucinania
     gamma_tensor = torch.tensor(gamma, device=device)
-    
-    # Standardowy mnożnik fokalny
     focal_multiplier = torch.pow(1.0 - p, gamma_tensor)
     
-    # Jeśli p jest zbyt małe, traktujemy próbkę jako szum i nakładamy stałą, małą wagę
-    weight = torch.where(p < truncation_threshold, torch.tensor(0.1, device=device), torch.tensor(1.0, device=device))
-    
-    focal_loss = weight * focal_multiplier * norm_loss
+    focal_loss = focal_multiplier * norm_loss
 
     if reduction == 'mean':
         return focal_loss.mean()
     return focal_loss
 
 
-def focal_ace_loss(log_probs, targets, input_lengths, target_lengths, gamma=2.0, reduction='mean'):
-    """ Focal ACE Loss - Łączy ACE z focal weighting. """
-    device = log_probs.device
-
-    # Obliczamy bazową stratę ACE
-    base_loss = ace_loss(log_probs, targets, input_lengths, target_lengths, reduction='none')
-
-    # Normalizacja przez długość (kluczowe, by długie słowa nie dominowały)
-    t_lengths = target_lengths.to(device).float().clamp(min=1.0)
-    norm_loss = base_loss / t_lengths
-
-    # Prawdopodobieństwo poprawnej predykcji
-    p = torch.exp(-base_loss) 
-
-    # Tworzymy stałe jako Tensory
-    one = torch.as_tensor(1.0, device=device, dtype=norm_loss.dtype)
-    gamma_t = torch.as_tensor(gamma, device=device, dtype=norm_loss.dtype)
-
-    # Obliczamy mnożnik fokalny
-    focal_weight = torch.pow(one - p, gamma_t)
-
-    # Nakładamy wagę fokalną na znormalizowaną bazową stratę
-    focal_weighted = focal_weight * norm_loss
-
-    # Redukcja
-    if reduction == 'mean':
-        return focal_weighted.mean()
-    elif reduction == 'sum':
-        return focal_weighted.sum()
-    return focal_weighted
-
-
 def inter_class_separation_loss(features, labels, margin=0.5):
     """ Inter-Class Separation Loss — wymusza minimalny odstęp między klasami.
         Dla HCR jest lepsze niż triplet loss, bo:
-        1. Nie wymaga hardnego mining tripletów
+        1. Nie wymaga miningu tripletów
         2. Globalnie odsuwa wszystkie klasy od siebie
-        3. Szybsze w treningu. """
+        3. Jest szybsze w treningu. """
     device = features.device
     unique_labels = labels.unique()
     n_classes = len(unique_labels)
@@ -1848,12 +1636,6 @@ def decode_with_per_char_confidence(outputs, encoder, noise_threshold=0.1):
     return batch_results
 
 
-def calculate_cer(pred_text, gt_text):
-    """ Liczy Character Error Rate dla Hard Miningu. """
-    if len(gt_text) == 0: return 1.0
-    return edit_distance(pred_text, gt_text) / len(gt_text)
-
-
 def get_focal_gamma_schedule(epoch, total_epochs, start_gamma=2.5, end_gamma=1.5):
     """ Harmonogram gamma dla focal loss — zmniejsza się w trakcie treningu.
         Wyższa gamma na początku (silniejszy focus na hard samples),
@@ -1878,7 +1660,7 @@ def predict_with_tta(model, image, encoder, num_augmentations=3):
             aug_image = image.clone()
             
             # Poprawna aplikacja szumu do znormalizowanego tensora (bez destrukcyjnego clampowania)
-            brightness_shift = torch.randn(1).item() * 0.1 * (1.0 / EMNIST_STD[0])
+            brightness_shift = torch.randn(1).item() * 0.1 * (1.0 / IAM_STD[0])
             aug_image = aug_image + brightness_shift
 
             logits_aug = model(aug_image)
@@ -1892,8 +1674,8 @@ def predict_with_tta(model, image, encoder, num_augmentations=3):
     return avg_log_probs
 
 
-def evaluate_loss_only(model, loader, device, encoder, smoothing=0.05, use_tta=False):
-    """ Szybka ewaluacja modelu z paskiem postępu. Oblicza średnią stratę na całym zbiorze walidacyjnym. """
+def evaluate_loss_only(model, loader, device, encoder, use_tta=False):
+    """ Szybka ewaluacja modelu z paskiem postępu. Oblicza surową, średnią stratę na całym zbiorze walidacyjnym. """
     model.eval()
     total_loss = 0.0
     batches = 0
@@ -1910,16 +1692,17 @@ def evaluate_loss_only(model, loader, device, encoder, smoothing=0.05, use_tta=F
                 try:
                     images = batch[0].to(device)
                     text_labels = batch[1]
+                    valid_widths = batch[3] if len(batch) > 3 else None
                 except RuntimeError as re:
                     # Device Mismatch lub CUDA Out of Memory
                     if "out of memory" in str(re).lower():
-                        tqdm.write(f"[{now()}] Krytyczny błąd VRAM: Brak pamięci podczas walidacji. Spróbuj zmniejszyć 'val_batch_size'.")
+                        tqdm.write(f"[{now()}] Krytyczny błąd VRAM: Brak pamięci podczas walidacji. Spróbuj zmniejszyć batch_size.")
                     else:
                         tqdm.write(f"[{now()}] Błąd wykonania PyTorch: {re}")
                     continue
 
                 except (IndexError, TypeError, AttributeError) as e:
-                    # Błędy struktury danych (np. gdy batch nie jest krotką/listą)
+                    # Błędy struktury danych
                     tqdm.write(f"[{now()}] Błąd formatu danych w loaderze: {e}. Sprawdź 'collate_fn'.")
                     continue
 
@@ -1941,7 +1724,7 @@ def evaluate_loss_only(model, loader, device, encoder, smoothing=0.05, use_tta=F
                     # Konwersja surowych logitów na log_probs przed CTC Loss
                     log_probs = torch.nn.functional.log_softmax(raw_logits.float(), dim=-1)
 
-                # Jeśli z jakiegoś powodu z TTA wyszedł (Batch, Time, Class), odwracamy to do standardu CTC
+                # Wymuszenie formatu CTC [Time, Batch, Class]
                 if log_probs.shape[0] == images.size(0) and log_probs.shape[1] > images.size(0):
                     log_probs = log_probs.permute(1, 0, 2)
 
@@ -1952,7 +1735,12 @@ def evaluate_loss_only(model, loader, device, encoder, smoothing=0.05, use_tta=F
                     tqdm.write(f" Cel (len={target_lengths.max()}) jest dłuższy niż mapa cech (len={T_dim}). Pomięcie.")
                     continue
 
-                input_lengths = torch.full(size=(batch_size,), fill_value=T_dim, dtype=torch.long).to(device)
+                # POPRAWKA: Usunięto pierwsze wywołanie loss i połączono logikę
+                if valid_widths is not None:
+                    input_lengths = torch.tensor([w // 4 for w in valid_widths], dtype=torch.long, device=device)
+                    input_lengths = torch.clamp(input_lengths, max=T_dim)
+                else:
+                    input_lengths = torch.full(size=(batch_size,), fill_value=T_dim, dtype=torch.long).to(device)
 
                 loss = focal_ctc_loss(log_probs, targets, input_lengths, target_lengths)
 
@@ -1966,7 +1754,7 @@ def evaluate_loss_only(model, loader, device, encoder, smoothing=0.05, use_tta=F
 
                 pbar.set_postfix({'batch_loss': f"{current_loss:.4f}"})
 
-        # Zabezpieczenie przed błędem 0.0000 gdy wszystkie paczki padną
+        # Zabezpieczenie przed błędem dzielenia przez zero
         if batches == 0:
             return float('inf')
 
@@ -1974,73 +1762,141 @@ def evaluate_loss_only(model, loader, device, encoder, smoothing=0.05, use_tta=F
 
 
 def evaluate_full_metrics(model, loader, device, encoder, decoder=None):
-    """ Zaawansowana ewaluacja z TTA i podziałem na długość słów. """
+    """ Pełna ewaluacja CER/WER z optymalnym wyliczaniem dystansu edycyjnego znak po znaku. """
     model.eval()
-
     stats = {
         'short': {'dist': 0, 'chars': 0, 'words': 0, 'err_words': 0},
         'medium': {'dist': 0, 'chars': 0, 'words': 0, 'err_words': 0},
         'long': {'dist': 0, 'chars': 0, 'words': 0, 'err_words': 0}
     }
 
+    # Licznik do szybkiego przerwania walidacji, jeśli model generuje 100% błędu (oszczędność czasu)
+    evaluated_samples = 0
+    max_debug_samples = 50000
+
     with torch.no_grad():
-        for batch in tqdm(loader, desc="Ewaluacja TTA", ncols=100, leave=False, file=sys.stdout):
+        for batch in tqdm(loader, desc="Ewaluacja WORD", ncols=100):
             if batch is None: continue
-            images, text_labels, _, _ = batch
+            images, text_labels, *rest = batch
             images = images.to(device)
-            B_orig = images.size(0)
 
-            # Test Time Augmentation (3 widoki)
-            v1 = images
-            v2 = torch.roll(images, shifts=2, dims=3)
-            v3 = torch.roll(images, shifts=-2, dims=3)
-            tta_batch = torch.cat([v1, v2, v3], dim=0)
+            # Bezpieczny forward pass bez potrajania batcha (ochrona przed OOM)
+            output = model(images)
+            log_probs = output[0] if isinstance(output, (tuple, list)) else output
+            
+            # Wymuszamy format [Batch, Time, Class] dla dekoderów
+            if log_probs.dim() == 3 and log_probs.shape[0] == images.size(0):
+                log_probs = log_probs.permute(1, 0, 2)
 
-            # Forward pass
-            output = model(tta_batch)
-            raw_logits = output[0] if isinstance(output, (tuple, list)) else output
-
-            # Konwersja na prawdopodobieństwa PRZED uśrednieniem dla poprawnej matematyki TTA
-            probs = torch.softmax(raw_logits.float(), dim=-1)
-
-            # Średnia pewność
-            T, B3, C = probs.shape
-            avg_probs = probs.view(T, 3, B_orig, C).mean(dim=1)
-            log_probs = torch.log(avg_probs + 1e-8)
-
-            # Dekodowanie
-            if decoder is not None:
+            if decoder:
                 preds = encoder.decode_beam_search(log_probs, decoder)
             else:
                 preds, _ = encoder.decode_greedy(log_probs)
 
-            # Akumulacja statystyk
-            for gt, pred in zip(text_labels, preds):
-                pred_str = str(pred)
-                dist = edit_distance(gt, pred_str)
-                length = len(gt)
-                category = 'short' if length < 5 else ('medium' if length < 9 else 'long')
+            for gt_word, pred_word in zip(text_labels, preds):
+                gt_str = str(gt_word).strip()
+                pred_str = str(pred_word).strip()
+                
+                evaluated_samples += 1
 
-                stats[category]['dist'] += dist
-                stats[category]['chars'] += length
-                stats[category]['words'] += 1
+                # Klasyczna ewaluacja na poziomie pojedynczych słów
+                length = len(gt_str)
+                cat = 'short' if length < 5 else ('medium' if length < 9 else 'long')
+                dist = edit_distance(gt_str, pred_str)
+                
+                stats[cat]['chars'] += length
+                stats[cat]['dist'] += dist
+                stats[cat]['words'] += 1
                 if dist > 0:
-                    stats[category]['err_words'] += 1
+                    stats[cat]['err_words'] += 1
 
-    tqdm.write(f"{'KATEGORIA':>10} | {'CER [%]':>10} | {'WER [%]':>10} | {'PRÓBEK':>6}")
-    for cat, data in stats.items():
+            # Szybki bezpiecznik: jeśli debugujemy model i wisimy na 100% CER, nie procesujemy całego wielogigabajtowego zbioru
+            if evaluated_samples >= max_debug_samples and stats['long']['chars'] > 0:
+                curr_cer = (stats['long']['dist'] / stats['long']['chars']) * 100
+                if curr_cer > 95.0:
+                    tqdm.write(f"      [DEBUG] CER zbliżone do 100% ({curr_cer:.2f}%). Przerywam wczesną ewaluację dla oszczędności CPU.")
+                    break
+
+    # Wyświetlanie tabeli raportu
+    tqdm.write(f"Pełny raport na słowach")
+    tqdm.write(f"{'KATEGORIA':>12} | {'CER [%]':>10} | {'WER [%]':>10} | {'PRÓBEK':>10}")
+    for cat in ['short', 'medium', 'long']:
+        data = stats[cat]
         cer = (data['dist'] / max(1, data['chars'])) * 100
         wer = (data['err_words'] / max(1, data['words'])) * 100
-        tqdm.write(f"{cat.upper():>10} | {cer:10.2f} | {wer:10.2f} | {data['words']:>6}")
-
+        tqdm.write(f"{cat.upper():>12} | {cer:10.2f} | {wer:10.2f} | {data['words']:>10}")
+    
+    if len(text_labels) > 0 and len(preds) > 0:
+        tqdm.write(f"DEBUG: GT: {text_labels[0]} | PRED: {preds[0]}")
+    
     return stats
 
 
+def run_sanity_check(model, data_loader, tokenizer, device, samples_per_category=2):
+    """ Testuje model, z uwzględnieniem krótkich, średnich i długich wyrazów. """
+    # Odwrócenie słownika dla dekodowania: {indeks: znak}
+    char_map = {v: k for k, v in tokenizer.items()}
+    
+    # Liczniki zebranych próbek w danych kategoriach (spacja, żeby było równo)
+    counts = {'KRÓTKIE': 0, 'ŚREDNIE': 0, 'DŁUGIE': 0}
+    
+    model.eval()  # Tryb ewaluacji
+    
+    with torch.no_grad():
+        for batch in data_loader:
+            # Przerwij pętlę, jeśli mamy już wymaganą liczbę przykładów dla wszystkich 3 kategorii
+            if all(c >= samples_per_category for c in counts.values()):
+                break
+                
+            images = batch[0].to(device)
+            labels = batch[1]  # Lista prawdziwych słów w batchu
+            
+            # Predykcja
+            preds = model(images)
+            preds_indices = torch.argmax(preds, dim=2).detach().cpu().numpy()
+            
+            # Zmieniamy kształt z [Time, Batch] na [Batch, Time]
+            preds_indices = preds_indices.transpose(1, 0)
+            
+            # Dekodowanie całego batcha
+            decoded_results = []
+            for sequence in preds_indices:
+                decoded_str = []
+                last_idx = -1
+                for idx in sequence:
+                    if idx != last_idx and idx != 0: 
+                        decoded_str.append(char_map.get(idx, ""))
+                    last_idx = idx
+                decoded_results.append("".join(decoded_str))
+            
+            # Kategoryzacja i wypisywanie wyników iterując po każdym słowie w batchu
+            for label, pred in zip(labels, decoded_results):
+                length = len(label)
+                
+                if length < 5:
+                    cat = 'KRÓTKIE'
+                elif length < 10:
+                    cat = 'ŚREDNIE'
+                else:
+                    cat = 'DŁUGIE'
+                
+                # Jeśli jeszcze potrzebujemy próbek w tej kategorii, wypisujemy ją
+                if counts[cat] < samples_per_category:
+                    # Formatowanie szerokości tekstu, żeby wyniki układały się w czytelną tabelę
+                    print(f"[{cat:<7}] Etykieta: {label:<15} | Predykcja: {pred}")
+                    counts[cat] += 1
+                    
+                    # Szybki check wewnętrzny, żeby nie iterować reszty batcha jeśli już mamy komplet
+                    if all(c >= samples_per_category for c in counts.values()):
+                        break
+            
+    model.train()  # Powrót do trybu treningowego
+
+
 def train_one_epoch(model, loader, optimizer, scaler, device, encoder, cat_weights,
-                    scheduler=None, use_contrastive=True, ema_model=None, writer=None,
-                    epoch=0, blank_penalty=0.05, use_focal=False, is_hard_mining=False, acc_steps=ACCUMULATION_STEPS,
-                    label_smoothing=0.0, focal_gamma=2.0, use_ace=False, center_criterion=None,
-                    optimizer_center=None, lambda_center=0.0, lambda_separation=0.0):
+                    scheduler=None, use_contrastive=True, ema_model=None, writer=None, acc_steps=1,
+                    epoch=0, use_focal=False, label_smoothing=0.0, focal_gamma=2.0, use_ace=False,
+                    center_criterion=None, optimizer_center=None, lambda_center=0.0, lambda_separation=0.0):
     """ Wykonuje jedną epokę treningową z uwzględnieniem dynamicznego balansowania klas.
         Logika Straty opiera się na dwóch filarach:
         1. Ważona Strata Fokalna — strata główna.
@@ -2048,9 +1904,8 @@ def train_one_epoch(model, loader, optimizer, scaler, device, encoder, cat_weigh
            które występują rzadziej w zbiorze danych, są dynamicznie skalowane w górę za pomocą
            odwrotności pierwiastka częstości. Zapobiega to ignorowaniu trudnych, długich sekwencji przez sieć.
         2. Contrastive Loss — strata pomocnicza.
-           Regularyzuje przestrzeń cech z warstw rekurencyjnych (BiGRU). Zbliża do siebie
-           wielowymiarowe reprezentacje takich samych słów (ucząc model ignorować styl pisma odręcznego)
-           oraz oddala od siebie słowa o różnych znakach. """
+           Regularyzuje przestrzeń cech z warstw rekurencyjnych. Zbliża do siebie wielowymiarowe reprezentacje
+           takich samych słów (ucząc model ignorować styl pisma odręcznego) oraz oddala od siebie słowa o różnych znakach. """
     model.train()
 
     # flatten_parameters wystarczy raz przed epoką
@@ -2061,23 +1916,20 @@ def train_one_epoch(model, loader, optimizer, scaler, device, encoder, cat_weigh
     step_lrs_list = []
     step_moms_list = []
 
-    # Zbieramy trudne próbki do przetworzenia po epoce
-    hard_samples = []
-
     if cat_weights is None:
-        cat_weights = {'short': 1.0, 'medium': 1.5, 'long': 2.5, 'line': 5.0}
+        cat_weights = {'short': 1.0, 'medium': 1.5, 'long': 2.5}
 
-    #Pobieramy liczbę jako czysty int
+    # Pobieramy liczbę jako czysty int
     total_batches = int(len(loader))
 
     with tqdm(loader, desc="Uczenie", leave=True, file=sys.stdout, dynamic_ncols=True) as loop:
         for i, batch in enumerate(loop):
             if batch is None: continue
 
-            # Początkowa aktualizacja paska postępu o liczbę zebranych trudnych próbek i średnią stratę
+            # Dynamiczny podgląd średniej straty z dotychczasowych kroków
+            running_avg_loss = total_loss / max(1, i)
             loop.set_postfix({
-                'Hard': len(hard_samples),
-                'Loss': total_loss / max(1, i)
+                'Avg_Loss': f"{running_avg_loss:.3f}"
             })
 
             # Zapisywanie aktualnego Learning Rate i Momentum
@@ -2085,22 +1937,40 @@ def train_one_epoch(model, loader, optimizer, scaler, device, encoder, cat_weigh
             current_mom = optimizer.param_groups[0].get('momentum', optimizer.param_groups[0].get('betas', (0.9, 0.999))[0])
             step_moms_list.append(current_mom)
 
-            # Rozpakowanie danych
-            if not isinstance(batch, (list, tuple)):
-                images, text_labels, categories = batch, [], []
-            else:
-                images = batch[0]
-                text_labels = batch[1] if len(batch) > 1 else []
-                categories = batch[2] if len(batch) > 2 else ['short'] * len(text_labels)
+            # Rozpakowanie surowych danych z batcha
+            raw_images = batch[0]
+            raw_text_labels = batch[1] if len(batch) > 1 else []
+            raw_categories = batch[2] if len(batch) > 2 else ['short'] * len(raw_images)
+            raw_valid_widths = batch[3] if len(batch) > 3 else [int(img.shape[-1]) for img in raw_images]
 
-            valid_batch_data = [(img, lbl, cat) for img, lbl, cat in zip(images, text_labels, categories) if
-                                len(lbl.strip()) > 0]
+            # Dynamiczne wyliczanie kategorii oraz filtrowanie pustych tekstów
+            valid_batch_data = []
+            valid_input_lengths = []
+            for img, lbl, cat, w in zip(raw_images, raw_text_labels, raw_categories, raw_valid_widths):
+                lbl_clean = lbl.strip()
+                if len(lbl_clean) == 0:
+                    continue
+                
+                # Przypisywanie kategorii na podstawie długości napisu
+                if len(lbl_clean) < 5:
+                    actual_cat = 'short'
+                elif len(lbl_clean) < 10:
+                    actual_cat = 'medium'
+                else:
+                    actual_cat = 'long'
+                    
+                valid_batch_data.append((img, lbl_clean, actual_cat))
+                valid_input_lengths.append(w // 32)
+
+            # Zabezpieczenie przed pustym batchem po filtracji
             if not valid_batch_data: continue
 
+            # Rekonstrukcja tensorów i list dla modeli i OHEM
             images = torch.stack([x[0] for x in valid_batch_data]).to(device)
             text_labels = [x[1] for x in valid_batch_data]
+            categories = [x[2] for x in valid_batch_data]
 
-            # Kodowanie etykiet
+            # Kodowanie etykiet na poziomie znaków dla CTC Loss
             targets_list = []
             target_lengths_list = []
             for t in text_labels:
@@ -2108,160 +1978,40 @@ def train_one_epoch(model, loader, optimizer, scaler, device, encoder, cat_weigh
                 targets_list.extend(encoded)
                 target_lengths_list.append(len(encoded))
 
-            targets = torch.tensor(targets_list, dtype=torch.long).to(device)
-            target_lengths = torch.tensor(target_lengths_list, dtype=torch.long).to(device)
+            targets = torch.tensor(targets_list, dtype=torch.long, device=device)
+            target_lengths = torch.tensor(target_lengths_list, dtype=torch.long, device=device)
 
-            # Zabezpieczenie przed pustymi batchami po wyrzuceniu łatwych przykładów
             if images.size(0) == 0:
                 continue
 
-            # Forward pass
+            # Forward pass z wykorzystaniem AMP
             with torch.amp.autocast('cuda', enabled=(scaler is not None), dtype=torch.bfloat16):
-                output = model(images, return_embeddings=use_contrastive)
-            
+                output, stn_img = model(images, return_embeddings=use_contrastive, return_stn=True)
+
             # Bezpieczne rozpakowanie
             if use_contrastive:
-                if isinstance(output, (tuple, list)) and len(output) == 3:
-                    preds_half, shortcut_preds, embeddings = output
+                if isinstance(output, (tuple, list)) and len(output) >= 2:
+                    preds_half = output[0]
+                    embeddings = output[-1]
                 else:
-                    raise ValueError(f"Oczekiwano 3 wartości w trybie contrastive, otrzymano {len(output)}. Sprawdź konfigurację modelu.")
+                    raise ValueError(f"Oczekiwano co najmniej 2 wartości w trybie contrastive, otrzymano {len(output) if isinstance(output, (tuple, list)) else 1}. Sprawdź konfigurację modelu.")
             else:
-                preds_half, shortcut_preds = output
+                preds_half = output[0] if isinstance(output, (tuple, list)) else output
                 embeddings = None
 
             # Float32 dla ochrony przed underflow, zapobiega eksplozji gradientów
             preds_fp32 = preds_half.float()
-
-            # Bezpieczne nałożenie kary
-            if blank_penalty > 0:
-                # Modyfikujemy istniejący kanał 'blank'
-                preds_fp32[:, :, 0] -= blank_penalty
-
-            # log_softmax zawsze w float32 dla stabilności numerycznej
-            log_preds = torch.nn.functional.log_softmax(preds_fp32, dim=-1)
-            T_dim = log_preds.size(0)
-            batch_size_current = images.size(0)
+            
+            # Przetworzone wyjście pod funkcje straty
+            log_preds = torch.nn.functional.log_softmax(preds_half.float(), dim=-1)
         
-            # Zbieranie Hard Samples
-            if is_hard_mining:
-                with torch.no_grad():
-                    # Zabezpieczenie przed błędami numerycznymi w predykcjach
-                    if not torch.isnan(log_preds).any():
-                        # Dekodujemy cały batch na tekst
-                        decoded, uncertainties = encoder.decode_greedy(log_preds.detach())
-                        
-                        # Zamiana nan na 0.0 w wynikach niepewności
-                        uncertainties = torch.nan_to_num(torch.tensor(uncertainties), nan=0.0).tolist()
-                        
-                        # Próbki spełniające kryteria trudności
-                        batch_scores = []
-                        
-                        # Wyliczenie progu trudności na podstawie średniej CER z dotychczasowych batchy, aby zapewnić stabilność i adaptacyjność procesu hard miningu
-                        dynamic_threshold = 0.25 
-                        
-                        for idx in range(batch_size_current):
-                            if torch.isnan(log_preds[:, idx, :]).any():
-                                continue
+            """ Usunąłem stąd karanie za spacje, CRNN otrzymuje czyste logity, a nie zmodyfikowane prawdopodobieństwa. Kara za spacje, będzie dopiero na poziomie etykiet. """
 
-                            pred_text = decoded[idx]
-                            true_text = text_labels[idx]
-                            cer = calculate_cer(pred_text, true_text)
-                            
-                            # odrzucamy próbki nieczytelne, idealne lub całkowicie błędne
-                            if (cer > 0.8 and uncertainties[idx] > 0.9) or cer == 0.0 or cer >= 1.0:
-                                continue
-
-                            # Pobieramy kategorię dla danej próbki
-                            sample_category = categories[idx] if idx < len(categories) else 'short'
-                            
-                            # Definiujemy wskaźnik "trudności" (uwzględnia CER i niepewność modelu)
-                            hardness_score = cer + (uncertainties[idx] * 0.5)
-
-                            # Zbieramy tylko próbki, które są trudniejsze niż obecny próg modelu
-                            if hardness_score > dynamic_threshold:
-                                batch_scores.append({
-                                    'idx': idx,
-                                    'score': hardness_score,
-                                    'cer': cer,
-                                    'uncertainty': uncertainties[idx],
-                                    'true_text': true_text,
-                                    'category': sample_category
-                                })
-
-                        # Logika S-OHEM: Wybieramy najtrudniejsze próbki z każdej kategorii
-                        if batch_size_current > 1:
-                            loss_strata = {}
-                            for item in batch_scores:
-                                c = item['category']
-                                if c not in loss_strata:
-                                    loss_strata[c] = []
-                                loss_strata[c].append(item)
-
-                            top_hard_samples = []
-                            ratio = 0.25
-
-                            for c, items in loss_strata.items():
-                                items.sort(key=lambda x: x['score'], reverse=True)
-                                num_hard_in_stratum = max(int(len(items) * ratio), 1)
-                                top_hard_samples.extend(items[:num_hard_in_stratum])
-                        else:
-                            top_hard_samples = batch_scores
-
-                        # Dodajemy wyselekcjonowane próbki do globalnej pamięci
-                        for item in top_hard_samples:
-                            hard_samples.append({
-                                'image': images[item['idx']].detach().cpu().to(torch.uint8), # Przenosimy do RAM jako uint8, żeby oszczędzić miejsce
-                                'label': item['true_text'],
-                                'cer': item['cer'],
-                                'score': item['score'] 
-                            })
-
-                        # Logika S-OHEM: Wybieramy najtrudniejsze próbki z każdej kategorii, aby zapewnić różnorodność trudnych przykładów
-                        if batch_size_current > 1:
-                            # S-OHEM: Grupowanie próbek po kategoriach (warstwach) - działa dla słów
-                            loss = {}
-                            for item in batch_scores:
-                                c = item['category']
-                                if c not in loss:
-                                    loss[c] = []
-                                loss[c].append(item)
-
-                            top_hard_samples = []
-                            ratio = 0.25
-
-                            # Dynamiczny próg: wybieramy 25% najtrudniejszych próbek Z KAŻDEJ warstwy osobno
-                            for c, items in loss.items():
-                                # Sortujemy w obrębie danej kategorii
-                                items.sort(key=lambda x: x['score'], reverse=True)
-                                
-                                # Obliczamy limit dla tej konkretnej kategorii
-                                num_hard_in_stratum = max(int(len(items) * ratio), 1)
-                                
-                                # Doklejamy najgorsze przykłady z tej kategorii do wspólnej puli
-                                top_hard_samples.extend(items[:num_hard_in_stratum])
-                        else:
-                            # Gdy Batch = 1 (Linie), po prostu przekazujemy próbkę do rygorystycznej oceny progowej
-                            top_hard_samples = batch_scores
-
-                        # Dodajemy wyselekcjonowane, zróżnicowane próbki do pamięci do fazy hybrydowej
-                        for item in top_hard_samples:
-                            # Próg minimalny (żeby nie zbierać literówek, gdy model już się poduczy)
-                            if (item['cer'] > 0.10 or item['uncertainty'] > 0.3) and item['cer'] < 1.0:
-                                hard_samples.append({
-                                    'image': images[item['idx']].detach().cpu().to(torch.uint8), # Przenosimy do RAM jako uint8, żeby oszczędzić miejsce
-                                    'label': item['true_text'],
-                                    'cer': item['cer'],
-                                    'score': item['score'] 
-                                })
-
-                        SAFE_RAM_LIMIT = 15000 
-                        if len(hard_samples) > SAFE_RAM_LIMIT:
-                            # Jeśli zebrano za dużo próbek, układamy je od najtrudniejszych do najprostszych i odrzucamy nadmiar
-                            hard_samples.sort(key=lambda x: x.get('score', x['cer']), reverse=True)
-                            hard_samples = hard_samples[:SAFE_RAM_LIMIT]
+            T_dim = log_preds.size(0)
 
             # Obliczanie strat (CTC/ACE)
-            input_lengths = torch.full((batch_size_current,), T_dim, dtype=torch.long, device=device)
+            input_lengths = torch.tensor(valid_input_lengths, dtype=torch.long, device=device)
+            input_lengths = torch.clamp(input_lengths, max=T_dim)
 
             if use_ace:
                 if use_focal:
@@ -2279,7 +2029,7 @@ def train_one_epoch(model, loader, optimizer, scaler, device, encoder, cat_weigh
                 if use_focal:
                     batch_losses = focal_ctc_loss(
                         log_preds, targets, input_lengths, target_lengths,
-                        gamma=focal_gamma, smoothing=label_smoothing, reduction='none'
+                        gamma=focal_gamma, reduction='none'
                     )
                 else:
                     batch_losses = label_smoothed_ctc_loss(
@@ -2306,14 +2056,19 @@ def train_one_epoch(model, loader, optimizer, scaler, device, encoder, cat_weigh
 
             # Contrastive Loss
             if use_contrastive:
-                loss_aux = torch.norm(embeddings + 1e-8, p=2, dim=1).mean()
-                alpha = torch.sigmoid(model.contrastive_alpha) * 0.4 + 0.5
-                loss = (alpha * loss_main) + ((1.0 - alpha) * loss_aux)
+                if isinstance(output, (tuple, list)) and len(output) >= 2:
+                    preds_half = output[0]
+                    embeddings = output[-1]
+                else:
+                    raise ValueError("W trybie contrastive oczekiwano co najmniej 2 wartości w output modelu (preds_half i embeddings). Sprawdź konfigurację modelu.")
+            else:
+                preds_half = output[0] if isinstance(output, (tuple, list)) else output
+                embeddings = None
 
             # Wspólne generowanie cech i etykiet
             char_labels = None
             if (center_criterion is not None and lambda_center > 0) or (lambda_separation > 0 and use_contrastive):
-                pooled_features = embeddings if use_contrastive else preds_fp32.mean(dim=0)
+                pooled_features = embeddings if use_contrastive else preds_fp32.mean(dim=1)
                 
                 # Szybkie tworzenie tensorów etykiet (bez pętli for na CPU)
                 if target_lengths.size(0) > 0:
@@ -2359,7 +2114,7 @@ def train_one_epoch(model, loader, optimizer, scaler, device, encoder, cat_weigh
                 if center_criterion is not None and optimizer_center is not None:
                     optimizer_center.zero_grad(set_to_none=True)
 
-                loop.set_postfix({'Loss': "NaN w Aux!", 'Hard': len(hard_samples)})
+                loop.set_postfix({'Loss': "NaN w Aux!"})
                 continue
 
             # Wsteczna propagacja
@@ -2368,7 +2123,8 @@ def train_one_epoch(model, loader, optimizer, scaler, device, encoder, cat_weigh
 
             # Optymalizacja
             if (i + 1) % int(acc_steps) == 0 or (i + 1) == total_batches:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                # Ucinamy gradienty do 5, żeby nie rosły w nieskończoność
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
 
@@ -2383,7 +2139,7 @@ def train_one_epoch(model, loader, optimizer, scaler, device, encoder, cat_weigh
                     scheduler.step()
 
             total_loss += loss.item()
-            loop.set_postfix({'Loss': f"{loss.item() * int(acc_steps):.3f}", 'Hard': len(hard_samples)})
+            loop.set_postfix({'Loss': f"{loss.item():.3f}"})
 
             # Logowanie do TensorBoard co 50 batchy
             if writer and (i % 50 == 0):
@@ -2401,150 +2157,62 @@ def train_one_epoch(model, loader, optimizer, scaler, device, encoder, cat_weigh
             if i % 100 == 0:
                 torch.cuda.empty_cache()
 
-    if is_hard_mining and len(hard_samples) > 0:
-        # Sortujemy całą zebraną poczekalnię od najtrudniejszych do najprostszych
-        hard_samples.sort(key=lambda x: x['score'], reverse=True)
-        
-        # Obliczamy ile to jest dokładnie 40% zebranych błędów
-        keep_count = max(1, int(len(hard_samples) * 0.40))
-        
-        # Brutalnie ucinamy listę do absolutnej czołówki
-        hard_samples = hard_samples[:keep_count]
-        
-        tqdm.write(f"Zakończono epokę. OHEM wyselekcjonował {keep_count} najtrudniejszych linii (Top 40%).")
-
-    return total_loss / total_batches, hard_samples, step_lrs_list, step_moms_list
+    return total_loss / total_batches, step_lrs_list, step_moms_list
 
 
-def execute_hybrid_ohem_phase(model, optimizer, scaler, encoder, device, hard_samples, iam_loader=None, polish_loader=None):
-    """ Kompletna faza OHEM:
-        1. Trenuje na najtrudniejszych liniach.
-        2. Zapobiega zapominaniu poprzez szybki update na słowach (IAM + Polskie znaki). """
-    if not hard_samples:
-        return
-
-    # Sprawdzenie wag (blokada przed NaN)
-    if any(torch.isnan(p).any() for p in model.parameters() if p is not None):
-        tqdm.write(f" KRYTYCZNY BŁĄD: Wykryto NaN w wagach modelu przed OHEM!")
-        return
-
-    criterion = torch.nn.CTCLoss(blank=0, reduction='mean', zero_infinity=True)
-    model.train()
+def run_bn_calibration(swa_model, train_dataset, device, batch_size=32):
+    """ Kalibracja statystyk BatchNorm po SWA. Wymaga loadera bez agresywnych augmentacji. 
+        Konieczna, żeby przy SWA model nie generował gorszych wyników. Trzeba sprawdzić na
+        czystym zbiorze, przed augmentacjami. """
+    # Loader z czystymi danymi, do sprawdzenia, jak sobie radzi model
+    calibration_loader = DataLoader(
+        train_dataset, 
+        batch_size=batch_size, 
+        shuffle=False,
+        collate_fn=collate_fn_dynamic,
+        num_workers=4
+    )
     
-    bg_val = (0.0 - float(EMNIST_MEAN[0])) / float(EMNIST_STD[0])
+    swa_model.eval()
+    
+    print(f"[{now()}] Rozpoczynam kalibrację BatchNorm.")
+    torch.optim.swa_utils.update_bn(calibration_loader, swa_model, device=DEVICE)
+    print(f"[{now()}] Kalibracja zakończona.")
 
-    hard_samples.sort(key=lambda x: x['cer'], reverse=True)
-    line_batch_pool = hard_samples
 
-    optimizer.zero_grad(set_to_none=True) 
-    num_steps = max(1, math.ceil(len(line_batch_pool) / SAFE_BATCH_SIZE))
-    accumulated_grads = False
+class CenterLoss(nn.Module):
+    """ Center Loss - minimalizuje wariancję wewnątrzklasową. 
+        Przyciąga wektory cech głębokich do wspólnych, wyuczalnych środków dla każdej klasy. """
+    def __init__(self, num_classes=94, feat_dim=128, device=torch.device('cuda')):
+        super(CenterLoss, self).__init__()
+        self.num_classes = num_classes
+        self.feat_dim = feat_dim
+        self.device = device
+        
+        # Inicjalizacja centroidów jako wyuczalnych parametrów
+        self.centers = nn.Parameter(torch.randn(self.num_classes, self.feat_dim).to(self.device))
 
-    # Trening na najtrudniejszych liniach (CVL)
-    for i in range(0, len(line_batch_pool), SAFE_BATCH_SIZE):
-        chunk = line_batch_pool[i : i + SAFE_BATCH_SIZE]
-        raw_imgs = [x['image'] for x in chunk]
-        lbls = [x['label'] for x in chunk]
+    def forward(self, x, labels):
+        # Centra muszą mieć ten sam dtype
+        centers = self.centers.to(x.dtype)
+        batch_size = x.size(0)
+        
+        # Obliczanie odległości euklidesowej między cechami a centroidami
+        distmat = torch.pow(x, 2).sum(dim=1, keepdim=True).expand(batch_size, self.num_classes) + \
+                  torch.pow(self.centers, 2).sum(dim=1, keepdim=True).expand(self.num_classes, batch_size).t()
+        distmat = torch.pow(x, 2).sum(dim=1, keepdim=True).expand(batch_size, self.num_classes) + \
+                  torch.pow(centers, 2).sum(dim=1, keepdim=True).expand(self.num_classes, batch_size).t()
 
-        processed_imgs = []
-        for img, label in zip(raw_imgs, lbls):
-            min_w = len(label) * 32 
-            curr_w = img.shape[2] 
-            if curr_w < min_w:
-                img = torch.nn.functional.pad(img, (0, min_w - curr_w), value=bg_val)
-            processed_imgs.append(img)
+        # Wyciąganie odległości tylko dla poprawnych klas
+        classes = torch.arange(self.num_classes).long().to(self.device)
+        labels_expand = labels.unsqueeze(1).expand(batch_size, self.num_classes)
+        mask = labels_expand.eq(classes.expand(batch_size, self.num_classes))
 
-        max_w = max(img.shape[2] for img in processed_imgs)
-        padded = torch.stack([
-            torch.nn.functional.pad(img, (0, max_w - img.shape[2]), value=bg_val)
-            for img in processed_imgs
-        ]).to(device)
-
-        with torch.amp.autocast('cuda', enabled=True, dtype=torch.bfloat16):
-            output = model(padded)
-            preds = output[0] if isinstance(output, tuple) else output
-            preds = torch.clamp(preds, min=-35, max=35)
-            lp = torch.nn.functional.log_softmax(preds.float(), dim=-1)
-            
-            if torch.isnan(lp).any(): continue
-
-            t, tl = encoder.encode_text(lbls)
-            il = torch.full((padded.size(0),), lp.size(0), dtype=torch.long, device=device)
-            l_ohem = criterion(lp, t.to(device), il, tl) / num_steps
-
-        if torch.isfinite(l_ohem):
-            l_ohem.backward() 
-            accumulated_grads = True
-
-    if accumulated_grads:
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
-        optimizer.step()
-        optimizer.zero_grad(set_to_none=True)
-        tqdm.write(f" OHEM: Linie przetworzone stabilnie.")
-
-    # Faza Retencyjna (IAM + Polskie Słowa)
-    retention_imgs = []
-    retention_lbls = []
-
-    # Pobieramy 4 słowa z IAM
-    if iam_loader:
-        try:
-            iam_batch = next(iter(iam_loader))
-            retention_imgs.append(iam_batch[0][:4])
-            retention_lbls.extend(iam_batch[1][:4])
-        except Exception: pass
-
-    # Pobieramy 4 słowa Polskie (z naciskiem na znaki diakrytyczne)
-    if polish_loader:
-        try:
-            pol_batch = next(iter(polish_loader))
-            retention_imgs.append(pol_batch[0][:4])
-            retention_lbls.extend(pol_batch[1][:4])
-        except Exception: pass
-
-    # Łączymy w jeden batch i trenujemy
-    if retention_imgs:
-        try:
-            # Znajdujemy maksymalną szerokość wśród wszystkich zebranych tensorów retencyjnych
-            max_ret_w = max(t.shape[3] for t in retention_imgs) 
-            
-            padded_retention = []
-            for t in retention_imgs:
-                # Obliczamy ile brakuje do najszerszego elementu w tym batchu
-                diff = max_ret_w - t.shape[3]
-                if diff > 0:
-		    # Padding tła do prawej krawędzi wartością bg_val
-                    t_padded = torch.nn.functional.pad(t, (0, diff), value=bg_val)
-                    padded_retention.append(t_padded)
-                else:
-                    padded_retention.append(t)
-            
-            # Teraz wszystkie mają ten sam kształt [4, 1, 64, max_ret_w]
-            imgs_word = torch.cat(padded_retention, dim=0).to(device)
-
-            lbls_word = retention_lbls
-
-            with torch.amp.autocast('cuda', enabled=True, dtype=torch.bfloat16):
-                output_w = model(imgs_word)
-                preds_w = output_w[0] if isinstance(output_w, tuple) else output_w
-                preds_w = torch.clamp(preds_w, min=-35, max=35)
-                
-                lp_w = torch.nn.functional.log_softmax(preds_w.float(), dim=-1)
-                
-                if torch.isnan(lp_w).any(): raise ValueError("NaN w fazie retencyjnej")
-
-                t_w, tl_w = encoder.encode_text(lbls_word)
-                il_w = torch.full((imgs_word.size(0),), lp_w.size(0), dtype=torch.long, device=device)
-                l_forget = criterion(lp_w, t_w.to(device), il_w, tl_w)
-
-            if torch.isfinite(l_forget):
-                l_forget.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
-                optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
-                tqdm.write(" OHEM: Faza retencyjna (PL + EN) zakończona.")
-        except Exception as e:
-            tqdm.write(f" OHEM Retency Warning: {e}")
+        dist = distmat * mask.float()
+        
+        # Sumowanie i uśrednianie straty
+        loss = dist.clamp(min=1e-12, max=1e+12).sum() / batch_size
+        return loss
 
 
 def align_prediction_to_ground_truth(gt_text, pred_text):
@@ -2797,7 +2465,7 @@ def get_safe_char_name(c):
 
 
 def save_crop_with_context(crop_img, context_vec, label_char, category, full_probs_vec, source_path, output_root, export_manifest, class_counts, crnn_pred=None):
-    """ Zapis wycinku litery z optymalizacją pod CapsNet i stabilnym pozycjonowaniem. (Funkcja wyciągnięta z zakresu lokalnego). """
+    """ Zapis wycinku litery z optymalizacją pod CapsNet i stabilnym pozycjonowaniem. """
     if crop_img is None or crop_img.size == 0:
         return
 
@@ -2811,26 +2479,20 @@ def save_crop_with_context(crop_img, context_vec, label_char, category, full_pro
 
     if work_img.size == 0: return
 
-    # Jawne rzutowanie na float
-    if float(np.mean(work_img)) > 127:
-        work_img = cv.bitwise_not(work_img)
+    # Konwersja do Numpy Array (przenoszenie do RAM)
+    work_img_np = work_img.get() if isinstance(work_img, cv.UMat) else work_img
 
-    # .get() zamienia UMat na ndarray
-    img_array = work_img.get() if isinstance(work_img, cv.UMat) else work_img
-
-    if img_array.mean() > 127:
-        work_img = cv.bitwise_not(work_img)
+    # Inwersja kolorów
+    if float(np.mean(work_img_np)) > 127:
+        work_img_np = cv.bitwise_not(work_img_np)
 
     # Progowanie Sauvola
-    work_img_np = work_img.get() if isinstance(work_img, cv.UMat) else work_img
-    work_img_np = cv.GaussianBlur(work_img_np, (3, 3), 0)
+    blur_img = cv.GaussianBlur(work_img_np, (3, 3), 0)
+    thresh_map = threshold_sauvola(blur_img, window_size=15, k=0.2)
 
-    # Sauvola zwraca tablicę progów lokalnych
-    thresh_map = threshold_sauvola(work_img_np, window_size=15, k=0.2)
-
-    # Tworzymy maskę binarną przez porównanie tablic
-    binary_mask = np.zeros(work_img_np.shape, dtype=np.uint8)
-    binary_mask[work_img_np < thresh_map] = 255
+    # Tworzymy maskę binarną
+    binary_mask = np.zeros_like(blur_img, dtype=np.uint8)
+    binary_mask[blur_img < thresh_map] = 255
 
     cnts, _ = cv.findContours(binary_mask, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
     if not cnts: return
@@ -2840,48 +2502,40 @@ def save_crop_with_context(crop_img, context_vec, label_char, category, full_pro
     valid_cnts = [c for c in cnts if cv.contourArea(c) > min_area]
     if not valid_cnts: return
 
-    if isinstance(work_img, cv.UMat):
-        img_np = work_img.get()
-    else:
-        img_np = work_img
-
-    center_x = img_np.shape[1] // 2
+    center_x = work_img_np.shape[1] // 2
 
     def get_c_info(c):
         M = cv.moments(c)
         if M["m00"] == 0: return 0, 0
         return int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"])
 
-    # Szukamy konturu, którego środek ciężkości jest najbliżej środka okna
+    # Szukamy konturu najbliżej środka
     main_cnt = min(valid_cnts, key=lambda c: abs(get_c_info(c)[0] - center_x))
     mx, my, mw, mh = cv.boundingRect(main_cnt)
     mcx, mcy = get_c_info(main_cnt)
 
     clean_mask = np.zeros_like(binary_mask)
-    cv.drawContours(
-        image=clean_mask,
-        contours=[main_cnt],
-        contourIdx=-1,
-        color=(255,),
-        thickness=-1
-    )
+    cv.drawContours(clean_mask, [main_cnt], -1, (255,), -1)
 
-    # Dodawanie kropek/akcentów z bezpiecznikiem pionowym
     collision_margin = max(mw // 1.5, 12)
     for c in valid_cnts:
-        if id(c) == id(main_cnt): continue
+        # Bezpieczne porównywanie referencji, zamiast adresów w pamięci
+        if c is main_cnt: continue
 
         cx, cy = get_c_info(c)
         if abs(cx - mcx) <= collision_margin and cy < (my + mh + 5):
             cv.drawContours(clean_mask, [c], -1, (255,), -1)
 
-    # Kadrowanie z zachowaniem proporcji (Padding)
+    # Zabezpieczenie przed wycianiem poza zakresem
     x, y, w, h = cv.boundingRect(clean_mask)
-    p = 2  # Mniejszy padding
-    char_roi = clean_mask[max(0, y - p):y + h + p, max(0, x - p):x + w + p]
+    p = 2
+    max_y, max_x = clean_mask.shape
+    char_roi = clean_mask[max(0, y - p):min(max_y, y + h + p), max(0, x - p):min(max_x, x + w + p)]
 
-    # Skalowanie do Canvas 64x64
-    canvas_size = 64
+    if char_roi.size == 0: return
+
+    # Skalowanie do 64x64
+    canvas_size = IMAGE_HEIGHT
     canvas = np.zeros((canvas_size, canvas_size), dtype=np.uint8)
     target_dim = 44 if label_char not in small_chars else 20
     scale = target_dim / max(h, w, 1)
@@ -2889,7 +2543,6 @@ def save_crop_with_context(crop_img, context_vec, label_char, category, full_pro
 
     resized = cv.resize(char_roi, (nw, nh), interpolation=cv.INTER_AREA)
 
-    # Centrowanie na środku canvasu
     y_off = (canvas_size - nh) // 2
     x_off = (canvas_size - nw) // 2
     canvas[y_off:y_off + nh, x_off:x_off + nw] = resized
@@ -2901,8 +2554,9 @@ def save_crop_with_context(crop_img, context_vec, label_char, category, full_pro
     unique_id = uuid.uuid4().hex[:8]
     filename_base = f"{safe_label}_{unique_id}"
 
+    # Prawidłowe rozszerzenie dla archiwum saveZ
     img_path = os.path.join(target_dir, filename_base + ".png")
-    npy_path = os.path.join(target_dir, filename_base + ".npy")
+    npz_path = os.path.join(target_dir, filename_base + ".npz") 
 
     cv.imwrite(img_path, canvas)
 
@@ -2910,7 +2564,7 @@ def save_crop_with_context(crop_img, context_vec, label_char, category, full_pro
     prob_array = full_probs_vec.detach().float().cpu().numpy() if torch.is_tensor(full_probs_vec) else np.array(full_probs_vec)
     ctx_array = context_vec.detach().float().cpu().numpy() if torch.is_tensor(context_vec) else np.array(context_vec)
 
-    np.savez(npy_path,
+    np.savez(npz_path,
              context_vector=ctx_array.flatten(),
              crnn_probs=prob_array.flatten(),
              crnn_pred=crnn_pred,
@@ -2928,7 +2582,21 @@ def save_crop_with_context(crop_img, context_vec, label_char, category, full_pro
 
 def export_error_crops_for_capsnet(model, loader, device, encoder, output_root):
     """ Eksport wycinków dla CapsNet z podwójną weryfikacją: normalna predykcja + przesunięcie geometryczne. """
-    if os.path.exists(output_root): shutil.rmtree(output_root)
+    if os.path.exists(output_root):
+        try:
+            shutil.rmtree(output_root)
+        except OSError as e:
+            tqdm.write(f"Ostrzeżenie: Nie można usunąć {output_root} (kod {e.errno}). Kontynuuję.")
+    
+    try:
+        os.makedirs(output_root, exist_ok=True)
+    except Exception as e:
+        tqdm.write(f"Krytyczny błąd: Brak uprawnień do zapisu w {output_root}: {e}")
+        return
+
+    model.eval()
+    export_manifest = []
+    class_counts = {}
     os.makedirs(output_root, exist_ok=True)
 
     model.eval()
@@ -2944,14 +2612,16 @@ def export_error_crops_for_capsnet(model, loader, device, encoder, output_root):
         pbar = tqdm(loader, desc="Eksport Deep Fusion", ncols=100, position=0, leave=True)
         for batch in pbar:
             if batch is None: continue
-            images, text_labels, _, paths = batch
+            images, text_labels, *rest = batch
+            paths = rest[2] if len(rest) >= 3 else (rest[1] if len(rest) >= 2 and isinstance(rest[1], (list, tuple)) else None)
+            
             images = images.to(device)
 
-            # Model zwraca 3 elementy (log_probs, b_ctx, stn_imgs) przy tych flagach
-            lp1, b_ctx, stn_imgs = model(images, return_stn=True, return_context=True)
+            # Pobieramy log_probs, żeby
+            lp1, b_ctx = model(images, return_context=True)
             
-            # Model zwraca 2 elementy (log_probs, stn_imgs) przy przesunięciu
-            lp3, _ = model(torch.roll(images, shifts=2, dims=3), return_stn=True)
+            # Predykcja sprawdzająca stabilność na przesuniętym obrazie
+            lp3 = model(torch.roll(images, shifts=2, dims=3))
 
             p1, idx1, m1, c1 = get_preds(lp1)
             _, idx3, _, _ = get_preds(lp3)
@@ -2959,7 +2629,7 @@ def export_error_crops_for_capsnet(model, loader, device, encoder, output_root):
             for b in range(images.size(0)):
                 if not torch.isfinite(lp1[b]).all():
                     continue
-                img_stn = ((stn_imgs[b].cpu().numpy().squeeze() * 0.5 + 0.5) * 255).clip(0, 255).astype(np.uint8)
+                img_stn = ((images[b].cpu().numpy().squeeze() * 0.5 + 0.5) * 255).clip(0, 255).astype(np.uint8)
                 gt_text = text_labels[b]
 
                 peaks = []
@@ -3001,14 +2671,15 @@ def export_error_crops_for_capsnet(model, loader, device, encoder, output_root):
                             crop = img_stn[:, x1:x2]
 
                             prob_val = p1[b][t_idx]
-                            
+
                             # Wywołania z zewnętrznym przekazaniem manifestu (bez safe_ep)
+                            current_path = paths[b] if paths else None
                             if is_wrong or is_unstable:
-                                save_crop_with_context(crop, windowed_ctx, char_gt, "hard", prob_val, paths[b], output_root, export_manifest, class_counts, p_info['char'])
+                                save_crop_with_context(crop, windowed_ctx, char_gt, "hard", prob_val, current_path, output_root, export_manifest, class_counts, p_info['char'])
                             elif p_info['margin'] < 0.20:
-                                save_crop_with_context(crop, b_ctx[b][t_idx], char_gt, "unsure", prob_val, paths[b], output_root, export_manifest, class_counts, p_info['char'])
+                                save_crop_with_context(crop, b_ctx[b][t_idx], char_gt, "unsure", prob_val, current_path, output_root, export_manifest, class_counts, p_info['char'])
                             elif random.random() < (UPPER_RATE if char_gt.isupper() else PURE_RATE):
-                                save_crop_with_context(crop, b_ctx[b][t_idx], char_gt, "pure", prob_val, paths[b], output_root, export_manifest, class_counts)
+                                save_crop_with_context(crop, b_ctx[b][t_idx], char_gt, "pure", prob_val, current_path, output_root, export_manifest, class_counts)
 
                     elif tag == 'insert':
                         t_p = peaks[i1 - 1]['t'] if i1 > 0 else 0
@@ -3048,8 +2719,11 @@ def export_error_crops_for_capsnet(model, loader, device, encoder, output_root):
 
                             if crop.size > 0 and np.sum(crop < 128) > min_ink_thresh:
                                 prob_val_missed = p1[b][t_est] if torch.is_tensor(p1[b][t_est]) else p1[b][t_est]
+                                current_path = paths[b] if paths else None
 
-                                save_crop_with_context(crop, b_ctx[b][t_est], char_gt, "missed", prob_val_missed, paths[b], output_root, export_manifest, class_counts)
+                                """ Weryfikacja wizualna: eksportujemy tylko te wycinki, które zawierają istotną ilość atramentu.
+                                    Zapobiega to przesyłaniu do CapsNetu czystego szumu lub pustych fragmentów tła, które nie niosą informacji o kształcie znaku. """
+                                save_crop_with_context(crop, b_ctx[b][t_est], char_gt, "missed", prob_val_missed, current_path, output_root, export_manifest, class_counts)
                 
                 if len(export_manifest) % 500 == 0:
                     torch.cuda.empty_cache()
@@ -3061,86 +2735,150 @@ def export_error_crops_for_capsnet(model, loader, device, encoder, output_root):
 
 
 class PolishCharStitcher:
-    """ Tworzy autentycznie wyglądające polskie słowa i pełne linie. """
+    """ Tworzy autentycznie wyglądające polskie słowa. """
     def __init__(self, npz_path=OUTPUT_NPZ):
-        data = np.load(npz_path, allow_pickle=True)
-        self.images = data['signs']
-        self.labels = data['labels']
+        self.npz_path = npz_path
+        # Nie ładujemy danych do RAM w momencie inicjalizacji klasy
+        self.images = None
+        self.labels = None
+        self.char_map = None
 
-        # Grupowanie obrazków po znakach dla szybkiego dostępu
-        self.char_map = {}
-        for i, char in enumerate(self.labels):
-            if char not in self.char_map:
-                self.char_map[char] = []
-            self.char_map[char].append(self.images[i])
+    def _lazy_init(self):
+        """ Wczytuje plik NPZ i buduje mapę dopiero przy pierwszym użyciu wewnątrz workera. """
+        if self.images is None:
+            data = np.load(self.npz_path, allow_pickle=True)
+            self.images = data['signs']
+            self.labels = data['labels']
+
+            # Grupowanie obrazków po znakach dla szybkiego dostępu
+            self.char_map = {}
+            for i, char in enumerate(self.labels):
+                if char not in self.char_map:
+                    self.char_map[char] = []
+                self.char_map[char].append(self.images[i])
 
     def generate_word_image(self, text: str, target_height=64):
+        # Dopiero przy generowaniu słów dodajemy obrazki i labele
+        self._lazy_init()
         word_imgs = []
         for char in text:
-            # ROZWIĄZANIE PROBLEMU POMIJANIA: Obsługa spacji
-            if char == " ":
-                space_w = random.randint(20, 35) # Losowa szerokość naturalnej spacji
+            if char in [" ", "_"]:
+                space_w = random.randint(20, 40) 
                 word_imgs.append(np.zeros((target_height, space_w), dtype=np.uint8))
                 continue
 
             samples = self.char_map.get(char)
             if not samples:
-                # Jeśli znaku nie ma, dajemy mały odstęp, by nie przerywać linii
                 word_imgs.append(np.zeros((target_height, 10), dtype=np.uint8))
                 continue
 
             char_img = random.choice(samples)
             h, w = char_img.shape
-            
-            # Augmentacja glifu
             M = cv.getRotationMatrix2D((w / 2, h / 2), random.uniform(-4, 4), random.uniform(0.95, 1.05))
             char_img = cv.warpAffine(char_img, M, (w, h), borderValue=0)
             word_imgs.append(char_img)
 
         if not word_imgs: return np.zeros((target_height, target_height), dtype=np.uint8)
 
-        # Obliczanie szerokości z marginesem bezpieczeństwa
         combined_width = sum([img.shape[1] for img in word_imgs]) + 40
         final_img = np.zeros((target_height, combined_width), dtype=np.uint8)
 
         current_x = 15
-        prev_anchor = None
+        prev_img_data = None 
+        
+        # Litery, które w kursywie kończą się "na górze" i łączą górą
+        high_exits = {'o', 'b', 'v', 'w', 'r', 'ó', 'a', 'e'}
 
-        for img in word_imgs:
+        for char, img in zip(text, word_imgs):
             h, w = img.shape
             if h != target_height:
                 w = int(w * (target_height / h))
                 img = cv.resize(img, (w, target_height))
                 h = target_height
 
-            y_offset = random.randint(-2, 2) # Lekkie drganie pionowe pisma
+            y_offset = random.randint(-2, 2)
             y_pos = max(0, min(target_height - h, (target_height - h) // 2 + y_offset))
 
-            # Rysowanie ligatury (tylko dla liter, pomijamy spacje o szerokości > 15)
-            if prev_anchor and w > 15:
-                current_anchor = (current_x + w // 5, y_pos + h // 2)
-                cv.line(final_img, prev_anchor, current_anchor, random.randint(80, 160), thickness=1)
+            is_space = char in [' ', '_'] or not np.any(img)
 
+            # Łączenie ligaturą
+            if prev_img_data and not is_space:
+                prev_img, p_x, p_y, prev_char = prev_img_data
+                
+                # Szukamy punktu wyjścia z poprzedniej litery
+                py_c, px_c = np.where(prev_img > 50)
+                if len(px_c) > 0:
+                    min_y, max_y = np.min(py_c), np.max(py_c)
+                    mid_y = min_y + (max_y - min_y) // 2
+                    
+                    if prev_char in high_exits:
+                        valid_p = np.where(py_c < mid_y)[0]
+                        if len(valid_p) == 0: valid_p = np.arange(len(px_c))
+                    else:
+                        valid_p = np.where(py_c >= mid_y)[0]
+                        if len(valid_p) == 0: valid_p = np.arange(len(px_c))
+                        
+                    best_p = valid_p[np.argmax(px_c[valid_p])]
+                    p0 = (p_x + px_c[best_p], p_y + py_c[best_p])
+                else:
+                    p0 = (p_x + prev_img.shape[1], p_y + prev_img.shape[0])
+
+                # Szukamy punktu wejścia do obecnej litery
+                cy_c, cx_c = np.where(img > 50)
+                if len(cx_c) > 0:
+                    min_y, max_y = np.min(cy_c), np.max(cy_c)
+                    mid_y = min_y + (max_y - min_y) // 2
+                    
+                    if prev_char in high_exits:
+                        valid_c = np.where(cy_c < mid_y)[0]
+                        if len(valid_c) == 0: valid_c = np.arange(len(cx_c))
+                    else:
+                        valid_c = np.where(cy_c >= mid_y)[0]
+                        if len(valid_c) == 0: valid_c = np.arange(len(cx_c))
+                        
+                    best_c = valid_c[np.argmin(cx_c[valid_c])]
+                    p2 = (current_x + cx_c[best_c], y_pos + cy_c[best_c])
+                else:
+                    p2 = (current_x, y_pos + h)
+
+                # Rysujemy krzywą
+                if p0[0] < p2[0]:
+                    curve_depth = random.randint(6, 12) 
+                    p1 = ((p0[0] + p2[0]) // 2, max(p0[1], p2[1]) + curve_depth)
+                    
+                    pts = []
+                    for t in np.linspace(0, 1, num=15):
+                        px = int((1-t)**2 * p0[0] + 2*(1-t)*t * p1[0] + t**2 * p2[0])
+                        py = int((1-t)**2 * p0[1] + 2*(1-t)*t * p1[1] + t**2 * p2[1])
+                        pts.append([px, py])
+                        
+                    pts = np.array(pts, np.int32).reshape((-1, 1, 2))
+                    ink_intensity = random.randint(200, 255)
+                    
+                    # Dynamiczna grubość
+                    thickness = max(1, min(3, int(w / 25)))
+                    cv.polylines(final_img, [pts], isClosed=False, color=ink_intensity, thickness=thickness, lineType=cv.LINE_AA)
+
+            # Wklejamy obecną literę na płótno
             region = final_img[y_pos:y_pos + h, current_x:current_x + w]
             final_img[y_pos:y_pos + h, current_x:current_x + w] = np.maximum(region, img)
 
-            # Kerning: zacieśniamy litery (overlap), ale nie spacje
-            overlap = int(w * random.uniform(0.15, 0.25)) if w > 35 else 0
+            # Kerning i zapisanie stanu
+            if not is_space:
+                overlap = int(w * random.uniform(0.15, 0.30)) 
+                prev_img_data = (img, current_x, y_pos, char)
+            else:
+                overlap = 0 
+                prev_img_data = None
+                
             current_x += (w - overlap)
-            prev_anchor = (current_x, y_pos + h // 2)
-
-        final_img = final_img[:, :current_x + 10]
-
-        # Post-processing dla realizmu
-        kernel = np.ones((2, 2), np.uint8)
-        final_img = cv.dilate(final_img, kernel, iterations=1)
-
-        if random.random() > 0.4:
-            final_img = self._apply_elastic_distortion(final_img)
-
-        final_img = cv.GaussianBlur(final_img, (3, 3), 0)
-        noise = np.random.randint(0, 10, final_img.shape, dtype=np.uint8)
-        return cv.add(final_img, noise)
+            
+        final_img = final_img[:, :current_x + 15]
+        
+        noise = np.random.randint(0, 11, final_img.shape, dtype=np.uint8)
+        final_img = cv.add(final_img, noise)
+        
+        return final_img
 
     @staticmethod
     def _apply_elastic_distortion(image, alpha=35, sigma=5, random_state=None):
@@ -3154,147 +2892,50 @@ class PolishCharStitcher:
         return map_coordinates(image, indices, order=1).reshape(shape)
 
 
-class IAMSyntheticLineDataset(Dataset):
-    """ Generuje w locie syntetyczne angielskie linie tekstu, sklejając losowe słowa z IAM.
-        Tworzy pomost edukacyjny między pojedynczymi słowami a rzeczywistymi liniami CVL. """
-    def __init__(self, h5_path, transform, char_list, split='train', num_samples=15000):
-        self.h5_path = h5_path
-        self.transform = transform
-        self.dictionary = set(char_list)
-        self.split = split
-        self.num_samples = num_samples
-        self.IMAGE_HEIGHT = 64
-        self.MAX_WIDTH = 2048
-
-        self.valid_indices = []
-        self.valid_labels = []
-        self.h5_file = None
-
-        with h5py.File(self.h5_path, 'r', swmr=True) as f:
-            raw_labels = f[self.split]['labels'][:]
-            for i, lbl in enumerate(raw_labels):
-                text = lbl.decode('utf-8') if isinstance(lbl, bytes) else str(lbl)
-                text = text.strip()
-                if text and all(c in self.dictionary for c in text):
-                    self.valid_indices.append(i)
-                    self.valid_labels.append(text)
-
-        self.dataset_len = len(self.valid_indices)
-        tqdm.write(f" Zainicjalizowano IAM Syntetyczne Linie: Baza {self.dataset_len} słów.")
-
-    def __len__(self):
-        return self.num_samples
-
-    def __getitem__(self, idx):
-        if getattr(self, 'h5_file', None) is None:
-            self.h5_file = h5py.File(self.h5_path, 'r', swmr=True)
-        # Losujemy od 4 do 8 słów, aby stworzyć pełną linię
-        num_words = random.randint(4, 8)
-        word_imgs = []
-        word_texts = []
-
-        for _ in range(num_words):
-            rand_idx = random.randint(0, self.dataset_len - 1)
-            h5_idx = self.valid_indices[rand_idx]
-            label = self.valid_labels[rand_idx]
-
-            img_data = self.h5_file[self.split]['images'][h5_idx]
-            if isinstance(img_data, np.ndarray) and img_data.ndim == 1:
-                img = cv.imdecode(img_data, cv.IMREAD_GRAYSCALE)
-            else:
-                img = img_data
-
-            if img is None or img.size == 0: continue
-            
-            # Wymuszamy czarne tło dla łatwego sklejania i dopełniania
-            if np.mean(img) > 127: img = cv.bitwise_not(img)
-
-            # Wyrównanie wysokości poszczególnych słów przed sklejeniem
-            h, w = img.shape[:2]
-            scale = self.IMAGE_HEIGHT / max(1, h)
-            new_w = max(16, int(w * scale))
-            img = cv.resize(img, (new_w, self.IMAGE_HEIGHT), interpolation=cv.INTER_AREA)
-
-            word_imgs.append(img)
-            word_texts.append(label)
-
-        if not word_imgs:
-            return self.__getitem__((idx + 1) % self.num_samples)
-
-        # Inicjalizacja linii pierwszym słowem
-        line_img = word_imgs[0]
-        line_text = word_texts[0]
-
-        # Iteracyjne doklejanie kolejnych słów z losowymi odstępami
-        for i in range(1, len(word_imgs)):
-            space_width = random.randint(15, 45) # Naturalna, zmienna szerokość spacji
-            space_img = np.zeros((self.IMAGE_HEIGHT, space_width), dtype=np.uint8)
-
-            # Hstack (horyzontalne łączenie macierzy numpy)
-            line_img = np.hstack((line_img, space_img, word_imgs[i]))
-            line_text += " " + word_texts[i]
-
-        # Zabezpieczenie szerokości dla zoptymalizowanego batchowania
-        if line_img.shape[1] > self.MAX_WIDTH:
-            line_img = cv.resize(line_img, (self.MAX_WIDTH, self.IMAGE_HEIGHT), interpolation=cv.INTER_AREA)
-
-        # Aplikacja augmentacji (już na całej wygenerowanej linii)
-        if self.transform:
-            augmented = self.transform(image=line_img)
-            line_img = augmented['image']
-
-        return line_img, line_text, "line", "synthetic_iam_line"
-
-    def get_text(self, idx):
-        return "Syntetyczna linia angielska z IAM"
-
-
 class PolishSyntheticDataset(Dataset):
-    """ Generuje w locie pojedyncze polskie słowa. 
-        Zmieniono z LineDataset na słowa, aby odciążyć pamięć VRAM. """
+    """ Generuje w locie pojedyncze polskie słowa. """
     def __init__(self, npz_path, word_list, transform=None, num_samples=5000):
         self.npz_path = npz_path
-        # Filtracja: bierzemy tylko słowa o długości min. 2 znaków
-        self.word_list = [w for w in word_list if len(w) > 1]
+        self.word_list = [w for w in word_list if len(w) > 0]
         self.transform = transform
         self.num_samples = num_samples
-        self.stitcher = None 
+        self.stitcher = PolishCharStitcher(self.npz_path)
 
     def __len__(self):
         return self.num_samples
 
     def __getitem__(self, idx):
-        # Leniwa inicjalizacja Stitchera
-        if self.stitcher is None:
-            self.stitcher = PolishCharStitcher(self.npz_path)
-
-        # Losowanie słowa z listy
-        word = random.choice(self.word_list)
+        # Wybieramy słow dla danego indeksu
+        word = self.word_list[idx % len(self.word_list)]
         
-        # Generowanie obrazu tylko dla jednego słowa
+        # Generujemy obraz słowa i robimy inwersję (format analogiczny do IAM)
         img = self.stitcher.generate_word_image(word)
-
-        if img is None:
-            return self.__getitem__((idx + 1) % self.num_samples)
-
-        # Dostosowanie do szerokości modelu
-        h, w = img.shape
-        if w > WORD_WIDTH:
-            img = cv.resize(img, (WORD_WIDTH, 64), interpolation=cv.INTER_AREA)
-
-        if self.transform:
-            img = self.transform(image=img)['image']
-
-        if len(word) < 5:
-            category = 'short'
-        elif len(word) < 10:
-            category = 'medium'
-        else:
-            category = 'long'
+        img = cv.bitwise_not(img)
         
-        return img, word, category, "synthetic_polish_word"
+        # Bezpiecznik
+        if img is None or img.ndim < 2 or img.size == 0:
+            img = np.zeros((64, 64), dtype=np.uint8)
+            word = "error" # Puste lub placeholder
+        
+        # Skalowanie zachowujące proporcje
+        h, w = img.shape[:2]
+        if h != 64:
+            scale = 64 / max(1, h)
+            new_w = max(16, int(w * scale))
+            img = cv.resize(img, (new_w, 64), interpolation=cv.INTER_AREA)
 
+        # Transformacje
+        if self.transform:
+            transformed = self.transform(image=img)
+            img = transformed['image']
+
+        # obraz, etykieta
+        return img, word
+    
     def get_text(self, idx):
+        """ Zwraca tekst dla danego indeksu na potrzeby samplera balansującego. """
+        if not self.word_list:
+            return ""
         return self.word_list[idx % len(self.word_list)]
 
 
@@ -3328,8 +2969,7 @@ def load_sjp_dictionary(file_path, alphabet_set, num_desired=30000):
     words = re.findall(r'\b[a-zA-ZąćęłńóśźżĄĆĘŁŃÓŚŹŻ]+\b', file_content)
 
     for word in words:
-        word = word.lower() # Sprowadzamy wszystko do małych liter dla spójności
-        # Sprawdzamy długość oraz czy WSZYSTKIE znaki są w naszym alfabecie modelu
+        # Sprawdzamy długość oraz zgodność z alfabetem
         if 3 < len(word) < 14 and all(c in alphabet_set for c in word):
             if any(char in polish_diacritics for char in word):
                 with_diacritics.append(word)
@@ -3361,7 +3001,8 @@ def load_sjp_dictionary(file_path, alphabet_set, num_desired=30000):
 
 
 def get_full_htr_char_list():
-    """ Zwraca stałą listę znaków zsynchronizowaną z Twoim mapowaniem. """
+    """ Zwraca stałą listę znaków zsynchronizowaną z mapowaniem. """
+    # Spacja odfiltrowana w DataLoader
     return [
         ' ', '!', '"', "'", '(', ')', ',', '-', '.', '/', # 1-10
         '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', # 11-20
@@ -3378,10 +3019,8 @@ def get_full_htr_char_list():
 
 
 def compute_char_confusion_data(model, dataloader, device, encoder):
-    """ 
-    Analizuje pomyłki wizualne modelu na całym zbiorze danych.
-    Zwraca spłaszczone listy znaków GT i Pred do macierzy pomyłek.
-    """
+    """ Analizuje pomyłki wizualne modelu na całym zbiorze danych.
+        Zwraca spłaszczone listy znaków GT i Pred do macierzy pomyłek. """
     model.eval()
     char_true = []
     char_pred = []
@@ -3394,7 +3033,7 @@ def compute_char_confusion_data(model, dataloader, device, encoder):
             if batch is None:
                 continue
 
-            images, text_labels, _, _ = batch
+            images, text_labels, *rest = batch
             images = images.to(device)
 
             # Bezpieczne rozpakowanie
@@ -3420,7 +3059,7 @@ def compute_char_confusion_data(model, dataloader, device, encoder):
                     char_true.extend([str(c) for c in aligned_gt])
                     char_pred.extend([str(c) for c in aligned_pred])
 
-    tqdm.write(f"[{time.strftime('%H:%M:%S')}] Analiza zakończona. Zebrano {len(char_true)} par znaków.")
+    tqdm.write(f"[{time.strftime('%H:%M:%S')}] Analiza zakończona. Zebrano {len(char_true)} znaków.")
     return char_true, char_pred
 
 
@@ -3522,6 +3161,15 @@ def generate_final_report(results, output_path="final_report.txt", plot_path="un
 
 
 if __name__ == "__main__":
+    writer = SummaryWriter(log_dir=LOG_DIR)
+    # Włączenie lepszej obsługi wielu procesów
+    try:
+        # 'spawn' tworzy nowe procesy od zera, nie kopiując stanu CUDA z procesu głównego
+        multiprocessing.set_start_method('spawn', force=True)
+        print("[INFO] Metoda startu procesów ustawiona na: spawn")
+    except RuntimeError:
+        pass # Metoda została już ustawiona
+        
     # Czyszczenie pamięci GPU i CPU przed startem
     torch.cuda.empty_cache()
     gc.collect()
@@ -3563,11 +3211,6 @@ if __name__ == "__main__":
     ema_model = AveragedModel(model, avg_fn=ema_avg, device=torch.device('cpu'))
     scaler = torch.amp.GradScaler('cuda')
 
-    try:
-        torch.multiprocessing.set_start_method('spawn', force=True)
-    except RuntimeError:
-        pass
-
     # Zarządzanie historią i checkpointami
     history_path = os.path.join(CHECKPOINT_FOLDER, "training_history.json")
     best_val_loss = float('inf')
@@ -3604,30 +3247,30 @@ if __name__ == "__main__":
     else:
         tqdm.write(f"[{now()}] Brak historii. Nowy trening.")
 
-        potential_checkpoints = [
-            CER_PATH,
-            CHECKPOINT_PATH,
-            os.path.join(CHECKPOINT_FOLDER, "checkpoint.pth")
-        ]
+    potential_checkpoints = [
+        CER_PATH,
+        CHECKPOINT_PATH,
+        os.path.join(CHECKPOINT_FOLDER, "checkpoint.pth")
+    ]
 
-        found_path = next((p for p in potential_checkpoints if os.path.exists(p)), None)
-        weights_loaded = False
+    found_path = next((p for p in potential_checkpoints if os.path.exists(p)), None)
+    weights_loaded = False
 
-        if found_path:
-            tqdm.write(f"[{now()}] Ładowanie wag z: {os.path.basename(found_path)}")
-            # Korzystamy z Twojej wbudowanej metody odpornej na zmiany alfabetu
-            loaded_epoch = model.load_weights(found_path, device=DEVICE)
-            if loaded_epoch > 0:
-                last_total_epoch = loaded_epoch
-            weights_loaded = True
+    if found_path:
+        tqdm.write(f"[{now()}] Ładowanie wag z: {os.path.basename(found_path)}")
+        # Korzystamy z Twojej wbudowanej metody odpornej na zmiany alfabetu
+        loaded_epoch = model.load_weights(found_path, device=DEVICE)
+        if loaded_epoch > 0:
+            last_total_epoch = loaded_epoch
+        weights_loaded = True
 
-            # Inicjalizacja EMA i bezpieczna synchronizacja
-            ema_avg = lambda avg, model_p, num_avg: 0.999 * avg + 0.001 * model_p
-            ema_model = AveragedModel(model, avg_fn=ema_avg, device=torch.device('cpu'))
+        # Inicjalizacja EMA i bezpieczna synchronizacja
+        ema_avg = lambda avg, model_p, num_avg: 0.999 * avg + 0.001 * model_p
+        ema_model = AveragedModel(model, avg_fn=ema_avg, device=torch.device('cpu'))
 
-            if weights_loaded:
-                ema_model.update_parameters(model)
-                tqdm.write(f"[{now()}] EMA zsynchronizowane z wczytanymi wagami.")
+        if weights_loaded:
+            ema_model.update_parameters(model)
+            tqdm.write(f"[{now()}] EMA zsynchronizowane z wczytanymi wagami.")
 
     scaler = torch.amp.GradScaler('cuda')
 
@@ -3654,56 +3297,70 @@ if __name__ == "__main__":
     all_files = glob.glob(os.path.join(DATA_ROOT, "iam_words", "words", "**", "*.png"), recursive=True)
     tqdm.write(f"[{now()}] Zaindeksowano: {len(all_files)} obrazów.")
 
-    random.shuffle(all_files)
-    split_idx = int(0.9 * len(all_files))
-
     # Val transforms - spójna normalizacja
     val_transform_crnn = alb.Compose([
-        alb.Normalize(mean=EMNIST_MEAN, std=EMNIST_STD),
+        alb.Normalize(mean=IAM_MEAN, std=IAM_STD),
         ToTensorV2()
     ])
 
-    # Inicjalizacja zbiorów
-    train_iam = IAMWordDataset(h5_path=IAM_WORDS_H5_PATH, transform=get_augmentations("main"),
-                               char_list=char_list, name="IAM_Train", split='train')
+    # Tworzenie zbioru IAM
+    train_iam = IAMWordDataset(h5_path=IAM_WORDS_H5_PATH, 
+                               transform=get_augmentations("main"),
+                               char_list=char_list, 
+                               name="IAM_Train",
+                               split='train')
 
-    train_polish = PolishSyntheticDataset(npz_path=OUTPUT_NPZ, word_list=polish_words_list,
-                                      transform=get_augmentations("main"), num_samples=12000)
+    val_iam = IAMWordDataset(h5_path=IAM_WORDS_H5_PATH, 
+                             transform=val_transform_crnn, # Czysty obraz
+                             char_list=char_list, 
+                             name="IAM_Val",
+                             split='val')
 
-    # Łączymy w jeden hybrydowy zbiór
+    # Ręczny podział słów
+    split_idx = int(0.9 * len(polish_words_list))
+    train_polish_words = polish_words_list[:split_idx]
+    val_polish_words = polish_words_list[split_idx:]
+
+    train_polish = PolishSyntheticDataset(npz_path=OUTPUT_NPZ, 
+                                          word_list=train_polish_words,
+                                          transform=get_augmentations("main"), 
+                                          num_samples=12000)
+
+    val_polish = PolishSyntheticDataset(npz_path=OUTPUT_NPZ, 
+                                        word_list=val_polish_words,
+                                        transform=val_transform_crnn, # Czysty obraz
+                                        num_samples=1333) # 10% z 12000 dla zachowania proporcji
+
+    # Łączymy w zbiory
     train_dataset = ConcatDataset([train_iam, train_polish])
+    val_dataset = ConcatDataset([val_iam, val_polish])
 
-    val_dataset = IAMWordDataset(h5_path=IAM_WORDS_H5_PATH, transform=val_transform_crnn,
-                                 char_list=char_list, name="Walidacyjny", split='val')
+    print(f"Całkowita liczba próbek: {len(train_dataset) + len(val_dataset)}")
+    print(f"Próbki treningowe: {len(train_dataset)}, walidacyjne: {len(val_dataset)}")
 
-    # Dynamiczne ważenie klas - definiujemy kategorie na podstawie długości słowa i obecności polskich znaków diakrytycznych
+    # Dynamiczne ważenie
     all_categories = []
-    alphabet = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZĄĆĘŁŃÓŚŹŻąćęłńóśźż.,!?:;()-\" '/"
-    
-    # Zbiór polskich znaków do filtrowania kategorii
     polish_diacritics = set("ĄĆĘŁŃÓŚŹŻąćęłńóśźż")
-
-    for ds in train_dataset.datasets:
-        # Sprawdzamy, czy to nasz syntetyczny dataset
-        if isinstance(ds, PolishSyntheticDataset):
-            # Dodajemy kategorię tyle razy, ile wynosi num_samples
-            all_categories.extend(["polish_diacritic"] * ds.num_samples)
+    
+    # Kategoryzacja słów z IAM_Train
+    for label in train_iam.valid_labels:
+        if any(c in polish_diacritics for c in label):
+            all_categories.append("polish_diacritic")
         else:
-            # Dla IAM Words iterujemy po faktycznych etykietach w RAM
-            for lbl in ds.valid_labels:
-                if any(c in polish_diacritics for c in lbl):
-                    all_categories.append("polish_diacritic")
-                else:
-                    length = len(lbl)
-                    cat = 'short' if length < 5 else ('medium' if length < 9 else 'long')
-                    all_categories.append(cat)
+            length = len(label)
+            cat = 'short' if length < 5 else ('medium' if length < 9 else 'long')
+            all_categories.append(cat)
+
+    # Kategoryzacja słów z PolishSynthetic_Train
+    for _ in range(len(train_polish)):
+        all_categories.append("polish_diacritic")
 
     # Obliczanie wag dynamicznych
     category_counts = Counter(all_categories)
     max_count = max(category_counts.values())
 
     """ Definiujemy wagi - polish_diacritic dostaje boost, żeby model zwracał szczególną uwagę na te znaki
-        (w większości różnią się tylko ogonkiem lub kreską, więc są trudniejsze do rozróżnienia) """
+        (w większości różnią się tylko ogonkiem lub kreską, więc są trudniejsze do rozróżnienia). """
     dynamic_weights_map = {
         "short": math.sqrt(max_count / max(category_counts["short"], 1)),
         "medium": math.sqrt(max_count / max(category_counts["medium"], 1)),
@@ -3711,76 +3368,66 @@ if __name__ == "__main__":
         "polish_diacritic": math.sqrt(max_count / max(category_counts["polish_diacritic"], 1)) * 1.5  # Boost dla polskich znaków
     }
 
-    tqdm.write(f"[{now()}] Liczebność klas: {dict(category_counts)}")
+    tqdm.write(f"[{now()}] Liczebność klas (Trening): {dict(category_counts)}")
     weights_str = ", ".join([f"{k}: {v:.2f}" for k, v in dynamic_weights_map.items()])
     tqdm.write(f"[{now()}] Wagi Balansujące: {weights_str}")
 
     weights = [dynamic_weights_map[cat] for cat in all_categories]
-    sampler = create_balanced_sampler(train_dataset, alphabet)
+    sampler = WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
 
     # Loader używa hybrydowego samplera łączącego polskie znaki już wcześniej
     train_loader = DataLoader(
         train_dataset,
-        batch_size=BATCH_SIZE_WORDS,
+        batch_size=BATCH_SIZE,
         sampler=sampler,
         shuffle=False,
         num_workers=WORKERS_MAIN,
         collate_fn=collate_fn_dynamic,
-        prefetch_factor=2, # Każdy worker trzyma 2 batche w gotowości
-        pin_memory=True, # Przyspiesza trening na GPU
+        pin_memory=(WORKERS_MAIN > 0),
+        prefetch_factor=2 if WORKERS_MAIN > 0 else None,
+        persistent_workers=(WORKERS_MAIN > 0),
         worker_init_fn=worker_init_fn
     )
 
     val_loader = DataLoader(
         val_dataset,
-        batch_size=BATCH_SIZE_WORDS,
+        batch_size=BATCH_SIZE,
         shuffle=False,
         num_workers=WORKERS_MAIN,
         collate_fn=collate_fn_dynamic,
-        pin_memory=False,
+        pin_memory=(WORKERS_MAIN > 0),
+        prefetch_factor=2 if WORKERS_MAIN > 0 else None,
         persistent_workers=(WORKERS_MAIN > 0),
         worker_init_fn=seed_worker,
         generator=g
     )
 
-    # Spróbuje NAdam, który często dobrze radzi sobie z CRNN-ami, ale z mniejszym LR i wagami L2 dla stabilności
-    optimizer = optim.NAdam(model.parameters(), lr=LR_MAIN, weight_decay=1e-4)
-    acc_steps = ACCUMULATION_STEPS
-
-    # Scheduler (OneCycle)
-    steps_per_epoch = len(train_loader) // ACCUMULATION_STEPS
-
-    scheduler = optim.lr_scheduler.OneCycleLR(
-        optimizer,
-        max_lr=LR_MAIN,
-        steps_per_epoch=steps_per_epoch,
-        epochs=EPOCHS_MAIN,
-        pct_start=PCT_START,
-        div_factor=DIV_FACTOR,
-        final_div_factor=100
-    )
-
-    # Przesuwamy scheduler, jeśli wznawiamy trening w fazie MAIN
-    if 0 < last_total_epoch < EPOCHS_MAIN:
-        tqdm.write(f"[{now()}] Przesuwanie schedulera epok o {last_total_epoch}.")
-        for _ in range(last_total_epoch * steps_per_epoch):
-            # OneCycleLR wymaga i+1 kroku lub wywołania .step() co partię (batch)
-            scheduler.step()
-
     # Main training
     if not os.path.exists(MAIN_PHASE_COMPLETE_FILE):
-        tqdm.write(f"[{now()}] Rozpoczynam Fazę Main (Agresywna augmentacja).")
+        tqdm.write(f"[{now()}] Rozpoczynam Fazę Main.")
         get_augmentations('main')
 
         decay_params = []
         no_decay_params = []
         for name, param in model.named_parameters():
             if not param.requires_grad: continue
-            if 'bias' in name or 'bn' in name or 'instance_norm' in name:
+            if 'bias' in name or 'bn' in name or 'norm' in name:
                 no_decay_params.append(param)
             else:
                 decay_params.append(param)
 
+        """ Optymalizator NAdam (Nesterov-accelerated Adaptive Moment Estimation):
+            Zastosowanie wariantu NAdam podyktowane jest złożonością przestrzeni błędu w architekturze 
+            hybrydowej (ResNet + BiLSTM). W przeciwieństwie do klasycznego Adama, NAdam wykorzystuje 
+            pęd Nesterova, który włącza do mianownika wyprzedzającą estymację przyszłej pozycji gradientu. 
+            Skutkuje to wyższym tłumieniem oscylacji w wąskich minimach lokalnych i zapobiega 
+            przeskakiwaniu optymalnych rozwiązań przy agresywnym tempie uczenia.
+            
+            Znaczenie parametru Epsilon:
+            Zapewnia on nie tylko stabilność numeryczną (chroni przed błędem dzielenia przez zero w 
+            mianowniku), ale pełni rolę bezpiecznika regularyzacyjnego. Twardo ogranicza maksymalny 
+            krok aktualizacji dla wag o mikroskopijnej wariancji gradientu, chroniąc wyuczone już 
+            filtry wizualne przed destrukcyjnymi skokami wywołanymi zaszumionymi próbkami. """
         optimizer = optim.NAdam([
         {
         'params': decay_params, 
@@ -3792,16 +3439,17 @@ if __name__ == "__main__":
         }
         ], lr=LR_MAIN / DIV_FACTOR)
 
-        steps_per_epoch = math.ceil(int(len(train_loader)) / int(acc_steps))
+        steps_per_epoch = math.ceil(int(len(train_loader)) / int(ACCUMULATION_STEPS_MAIN))
         main_scheduler = optim.lr_scheduler.OneCycleLR(
             optimizer, max_lr=LR_MAIN,
             steps_per_epoch=steps_per_epoch,
             epochs=EPOCHS_MAIN, pct_start=PCT_START, div_factor=DIV_FACTOR, final_div_factor=100
         )
 
+        # Przesuwamy o łączną ilość kroków przez wszystkie epoki przy wznawianiu
         start_ep = last_total_epoch if last_total_epoch < EPOCHS_MAIN else 0
         if start_ep > 0:
-            for _ in range(steps_per_epoch):
+            for _ in range(start_ep * steps_per_epoch):
                 main_scheduler.step()
 
         patience_counter = 0
@@ -3811,11 +3459,12 @@ if __name__ == "__main__":
             # Wykonujemy trening epoki
             current_gamma = get_focal_gamma_schedule(epoch, EPOCHS_MAIN, start_gamma=2.5, end_gamma=1.5)
             
-            t_loss, _, e_lrs, e_moms = train_one_epoch(
+            # Bez głowicy kontrastowej, na początek model uczy się czytać
+            t_loss, e_lrs, e_moms = train_one_epoch(
                 model, train_loader, optimizer, scaler, DEVICE, encoder, 
                 scheduler=main_scheduler, cat_weights=dynamic_weights_map, 
-                epoch=epoch, focal_gamma=current_gamma, # Przekazujemy dynamicznie parametr skupienia
-                writer=writer
+                epoch=epoch, focal_gamma=current_gamma, use_focal=False,
+                use_contrastive=False, writer=writer, acc_steps=ACCUMULATION_STEPS_MAIN
             )
 
             # Aktualizacja historii uczenia
@@ -3825,6 +3474,9 @@ if __name__ == "__main__":
 
             # Walidacja
             val_loss = evaluate_loss_only(model, val_loader, DEVICE, encoder)
+
+            # Sprawdzenie na 3 próbkach
+            run_sanity_check(model, val_loader, encoder.char_to_num, DEVICE, samples_per_category=3)
 
             # Zapis wyników do historii
             history['train_loss'].append(t_loss)
@@ -3887,37 +3539,37 @@ if __name__ == "__main__":
         gc.collect()
         torch.cuda.empty_cache()
 
-    # Fine-tune (Focal CTC Loss, więc na początku znacznie wyższy loss, bo inaczej liczony)
+    # Fine-tune
     if os.path.exists(MAIN_PHASE_COMPLETE_FILE) and not os.path.exists(FINE_COMPLETE_FILE):
-        tqdm.write(f"[{now()}] Rozpoczynam Fazę Fine-tune (Optymalizacja wag używająca SWA do znalezienia płaskiego, "
-                   f"bezpiecznego minimum straty, aby uniknąć overfittingu).")
-        get_augmentations("fine_tune")
+        tqdm.write(f"[{now()}] Rozpoczynam Fazę Fine-tune (SWA - uśrednianie wag).")
+        
+        # Tworzymy zbiory z nowymi, delikatniejszymi augmentacjami dla fine-tuning
+        fine_transforms = get_augmentations("fine_tune")
+        
+        train_iam = IAMWordDataset(h5_path=IAM_WORDS_H5_PATH, transform=fine_transforms,
+                                   char_list=char_list, name="IAM_Train")
 
+        train_polish = PolishSyntheticDataset(npz_path=OUTPUT_NPZ, word_list=polish_words_list,
+                                              transform=fine_transforms, num_samples=12000)
+
+        # Łączymy zbiory
+        fine_tune_dataset = ConcatDataset([train_iam, train_polish])
+        
+        # Inicjalizacja modelu SWA
         swa_model = AveragedModel(model).to(DEVICE)
-        model.load_state_dict(torch.load(os.path.join(CHECKPOINT_FOLDER, "WordLevelResNetCRNN.pth"))['model_state'])
+        
+        # Ładujemy najlepsze wagi z fazy main
+        checkpoint = torch.load(os.path.join(CHECKPOINT_FOLDER, "WordLevelResNetCRNN.pth"))
+        model.load_state_dict(checkpoint['model_state'])
 
-        synth_iam_lines = IAMSyntheticLineDataset(
-            h5_path=IAM_WORDS_H5_PATH, 
-            transform=get_augmentations("fine_tune"), 
-            char_list=char_list, 
-            split='train',
-            num_samples=8000
-        )
-
-        fine_tune_dataset = ConcatDataset([train_iam, train_polish, synth_iam_lines])
-
+        # DataLoader-y
         train_loader = DataLoader(
-            fine_tune_dataset, batch_size=BATCH_SIZE_WORDS, num_workers=WORKERS_FINE,
-            collate_fn=collate_fn_dynamic, pin_memory=False, worker_init_fn=worker_init_fn
+            fine_tune_dataset, batch_size=BATCH_SIZE, num_workers=WORKERS_FINE,
+            collate_fn=collate_fn_dynamic, pin_memory=False, worker_init_fn=worker_init_fn, shuffle=True
         )
-
         val_loader = DataLoader(
-            val_dataset,
-            batch_size=BATCH_SIZE_WORDS,
-            shuffle=False,
-            num_workers= WORKERS_FINE,
-            collate_fn=collate_fn_dynamic,
-            pin_memory=False
+            val_dataset, batch_size=BATCH_SIZE, shuffle=False,
+            num_workers=WORKERS_FINE, collate_fn=collate_fn_dynamic, pin_memory=False
         )
 
         decay_params = []
@@ -3925,25 +3577,29 @@ if __name__ == "__main__":
 
         for name, param in model.named_parameters():
             if not param.requires_grad: continue
-            # Nie stosujemy weight decay dla biasów i BatchNorm
+            """ Nie stosujemy weight decay dla biasów i BatchNorm, bias to po prostu przesunięcie, a BatchNorm ma już własny mechanizm
+                normalizacji wag i statystyk, przez co nakładanie na nie dodatkowej kary L2 (weight decay) prowadzi do
+                konfliktu optymalizacyjnego i może destabilizować trening. """
             if "bias" in name or "bn" in name or "norm" in name:
                 no_decay_params.append(param)
             else:
                 decay_params.append(param)
 
         """ Zmiana optymalizatora dla fazy Fine-tune:
-            Zastąpienie adaptacyjnego optymalizatora (NAdam) klasycznym SGD z pędem.
-            Uzasadnienie: SWA osiąga optymalne rezultaty, gdy optymalizator "krąży" na brzegach szerokiego
-            i płaskiego minimum. Adaptacyjne algorytmy mają tendencję do zbyt szybkiego zbiegania w ostre
-            minima lokalne. SGD pozwala na stabilną eksplorację Płaskich regionów, co po uśrednieniu wag
-            drastycznie poprawia generalizację modelu. Opcja nesterov=True dodaje przewidywanie kierunku gradientu,
-            zapobiegając nadmiernym oscylacjom."""
+            Zastąpienie adaptacyjnego optymalizatora klasycznym SGD z pędem.
+            Uzasadnienie: SWA osiąga optymalne rezultaty, gdy optymalizator krąży na brzegach szerokiego i płaskiego minimum.
+            Adaptacyjne algorytmy mają tendencję do zbyt szybkiego zbiegania w ostre minima lokalne. SGD pozwala na stabilną
+            eksplorację płaskich regionów, co po uśrednieniu wag drastycznie poprawia generalizację modelu.
+            Zmniejszono jednak weight_decay do 1e-6, aby zapobiec dominacji kary L2 przy niskim LR, co wcześniej powodowało amnezję modelu. """
         optimizer = optim.SGD([
-            {'params': decay_params, 'weight_decay': 1e-4}, # Niższy decay dla fine-tune
+            {'params': decay_params, 'weight_decay': 1e-6}, # Ochrona przed zerowaniem wag!
             {'params': no_decay_params, 'weight_decay': 0.0}
-        ], lr=LR_FINE_TUNE, momentum=0.9, nesterov=True)
-        total_fine_steps = math.ceil(EPOCHS_FINE_TUNE * len(train_loader) / acc_steps)
-        fine_scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_fine_steps, eta_min=1e-8)
+        ], lr=1e-4, momentum=0.9, nesterov=True) # Zwiększony startowy LR, żeby SWA miało co uśredniać
+
+        total_fine_steps = math.ceil(EPOCHS_FINE_TUNE * len(train_loader) / ACCUMULATION_STEPS_FINE)
+        
+        # Opadanie do 1e-6 zapewni płynne osiadanie po początkowej eksploracji
+        fine_scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_fine_steps, eta_min=1e-6)
 
         """ Nie wyliczamy bazowego błędu na starcie, ponieważ SWA często wywołuje początkowy skok straty
             szukając płaskiego minimum. Sztywny próg zablokowałby zapis wczesnych epok. """
@@ -3957,24 +3613,32 @@ if __name__ == "__main__":
             # Gamma scheduling dla fine-tune (niższe wartości)
             current_gamma = get_focal_gamma_schedule(epoch, EPOCHS_FINE_TUNE, start_gamma=2.0, end_gamma=1.2)
 
-            train_loss, current_hard_pool, e_lrs, e_moms = train_one_epoch(
-                model, train_loader, optimizer, scaler, DEVICE, encoder, # type: ignore
-                cat_weights=dynamic_weights_map, scheduler=fine_scheduler, is_hard_mining=False,
-                ema_model=ema_model, epoch=current_total_epoch, blank_penalty=0.05,
+            train_loss, e_lrs, e_moms = train_one_epoch(
+                model, train_loader, optimizer, scaler, DEVICE, encoder, 
+                cat_weights=dynamic_weights_map, scheduler=fine_scheduler,
+                ema_model=ema_model, epoch=current_total_epoch,
                 label_smoothing=0.02, focal_gamma=current_gamma,
-                use_focal=True, acc_steps=ACCUMULATION_STEPS,
-                writer=writer
+                use_focal=True, acc_steps=ACCUMULATION_STEPS_FINE,
+                use_contrastive=True, writer=writer
             )
 
             # Zapisujemy zebrane dane do historii wykresu
             history.setdefault('step_lrs', []).extend(e_lrs)
             history.setdefault('step_moms', []).extend(e_moms)
 
+            current_lr = optimizer.param_groups[0]['lr']
+            if writer:
+                writer.add_scalar('LR/Fine_Tune', current_lr, epoch)
+                writer.add_scalar('Loss/Fine_Train', train_loss, epoch)
+
             swa_model.update_parameters(model)
 
             # Walidujemy standardowy model w trakcie trwania pętli
             val_loss = evaluate_loss_only(model, val_loader, DEVICE, encoder)
             tqdm.write(f"          Fine Loss: {val_loss:.4f}")
+
+            # Sprawdzenie na 3 próbkach
+            run_sanity_check(model, val_loader, encoder.char_to_num, DEVICE, samples_per_category=3)
 
             with open(history_path, "w") as f:
                 json.dump(history, f)
@@ -3986,14 +3650,17 @@ if __name__ == "__main__":
 
         # Aktualizujemy statystyki BN dla SWA i to ten model staje się naszym najlepszym
         tqdm.write(f"[{now()}] Kalibracja BatchNorm dla modelu SWA.")
-        torch.optim.swa_utils.update_bn(train_loader, swa_model, device=DEVICE)
+        for ds in train_dataset.datasets:
+            ds.transform = val_transform_crnn
+        run_bn_calibration(swa_model, train_dataset, DEVICE)
 
         swa_final_loss = evaluate_loss_only(swa_model, val_loader, DEVICE, encoder)
         tqdm.write(f"[{now()}] Ostateczny loss SWA: {swa_final_loss:.4f}")
 
         # Nadpisujemy cer_path ostatecznym, uśrednionym modelem
         torch.save({
-            'model_state': swa_model.module.state_dict(),
+            'model_state': (swa_model.module.state_dict() if hasattr(swa_model, 'module') else swa_model.state_dict()),
+            'ema_state': ema_model.state_dict(),
             'best_loss': swa_final_loss,
             'epoch': EPOCHS_MAIN + EPOCHS_FINE_TUNE
         }, CER_PATH)
@@ -4006,326 +3673,117 @@ if __name__ == "__main__":
         gc.collect()
         torch.cuda.empty_cache()
 
-    # Hard-Mining
-    hard_mining_history = []
-    if os.path.exists(FINE_COMPLETE_FILE) and not os.path.exists(HARD_MINING_COMPLETE_FILE):
-        tqdm.write(f"[{now()}] Rozpoczynam Fazę Hard Mining (Skupienie na najtrudniejszych próbkach, które model ma problemy z rozpoznaniem).")
-        if os.path.exists("hard_mining_history.json"):
-            with open("hard_mining_history.json", "r") as f:
-                try:
-                    hard_mining_history = json.load(f)
-                except:
-                    hard_mining_history = []
-
-        # Gradient checkpointing - zamiast zapamiętywać wszystkiego, model robi checkpointy, co jest mniej obciążające dla pamięci
-        if hasattr(model.cnn, 'gradient_checkpointing_enable'):
-            model.cnn.gradient_checkpointing_enable()
-            tqdm.write(f"[{now()}] Gradient Checkpointing włączony dla modułu ResNet.")
-        elif hasattr(model.cnn, 'model') and hasattr(model.cnn.model, 'set_grad_checkpointing'):
-            # Czasami trzeba wejść głębiej
-            model.cnn.model.set_grad_checkpointing(True)
-            tqdm.write(f"[{now()}] Gradient Checkpointing włączony dla CNN.")
-
-        # Inicjalizacja transformacji przed pętlą
-        line_transform = alb.Compose([
-            alb.ColorJitter(brightness=0.2, contrast=0.2, p=0.5),
-            alb.GaussianBlur(blur_limit=(3, 3), p=0.3),
-            alb.Normalize(mean=EMNIST_MEAN, std=EMNIST_STD),
-            ToTensorV2()
-        ])
-
-        # Loader treningowy
-        cvl_train_dataset = CVLLineDataset(CVL_H5_PATH, line_transform, char_list, split='train')
-        cvl_train_loader = DataLoader(
-            cvl_train_dataset,
-            batch_size=BATCH_SIZE_LINES,
-            shuffle=False,
-            collate_fn=collate_fn_dynamic,
-            num_workers=0,
-            pin_memory=False,
-            worker_init_fn=worker_init_fn
-        )
-
-        # Loader walidacyjny dla CVL
-        cvl_val_dataset = CVLLineDataset(CVL_H5_PATH, line_transform, char_list, split='val')
-        cvl_val_loader = DataLoader(
-            cvl_val_dataset,
-            batch_size=BATCH_SIZE_LINES,
-            shuffle=False,
-            collate_fn=collate_fn_dynamic,
-            num_workers=WORKERS_HARD_MINING
-        )
-
-        # Loader walidacyjny dla IAM (Strażnik Generalizacji)
-        iam_val_dataset = CVLLineDataset(IAM_LINES_H5_PATH, line_transform, char_list, split='val')
-        iam_val_loader = DataLoader(
-            iam_val_dataset,
-            batch_size=BATCH_SIZE_LINES,
-            shuffle=False,
-            collate_fn=collate_fn_dynamic,
-            num_workers=WORKERS_HARD_MINING
-        )
-
-        # Mix walidacyjny: oba datasety dla bezpieczeństwa
-        iam_lines_val_dataset = CVLLineDataset(IAM_LINES_H5_PATH, line_transform, char_list, split='val')
-        val_dataset_mix = ConcatDataset([cvl_val_dataset, iam_lines_val_dataset])
-        val_loader_mix = DataLoader(
-            val_dataset_mix,
-            batch_size=BATCH_SIZE_LINES,
-            shuffle=False,
-            collate_fn=collate_fn_dynamic,
-            num_workers=WORKERS_HARD_MINING
-        )
-
-        mining_params = []
+    # Klastrowanie Cech
+    if os.path.exists(FINE_COMPLETE_FILE) and not os.path.exists(ALIGNMENT_COMPLETE_FILE):
+        tqdm.write(f"[{now()}] Dostosowywanie mapy cech w sposób przydatny dla CapsNet przy użyciu Center Loss.")
         
-        for module_name, module, lr_val in [
-            ('cnn', model.cnn, CNN_LR), 
-            ('rnn', model.rnn, RNN_LR), 
-            ('output', model.output, OUTPUT_LR)
-        ]:
-            decay_group = []
-            no_decay_group = []
-            for name, param in module.named_parameters():
-                if not param.requires_grad: continue
-                if "bias" in name or "bn" in name or "norm" in name:
-                    no_decay_group.append(param)
-                else:
-                    decay_group.append(param)
+        # Wczytanie najlepszego modelu SWA z poprzedniej fazy
+        tqdm.write(f"[{now()}] Wczytywanie wygładzonych wag SWA do klastrowania.")
+        checkpoint = torch.load(CER_PATH, map_location=DEVICE, weights_only=False)
+        model.load_state_dict(checkpoint['model_state'])
+        model.to(DEVICE)
+
+        # Zamrożenie wizualnego ekstraktora
+        for param in model.cnn.parameters():
+            param.requires_grad = False
             
-            mining_params.append({'params': decay_group, 'lr': lr_val, 'weight_decay': 0.01})
-            mining_params.append({'params': no_decay_group, 'lr': lr_val, 'weight_decay': 0.0})
+        tqdm.write(f"[{now()}] Zamrożono kręgosłup ResNet. Trenowanie wyłącznie BiLSTM i Głowic Projekcyjnych.")
 
-        """ Zmiana optymalizatora dla fazy Hard Mining:
-            Zastąpienie NAdam optymalizatorem AdamW z zachowawczym epsilonem.
-            Uzasadnienie: Faza ta eksponuje model na najtrudniejsze i najsilniej zniekształcone próbki, 
-            które generują wysokie wartości błędu. NAdam, wykorzystujący agresywny pęd Nesterova, mógłby 
-            zbyt gwałtownie zaktualizować wagi i zniszczyć wyuczone wcześniej filtry wizualne (tzw. 
-            katastroficzne zapominanie). AdamW rozdziela regularyzację od kroku adaptacyjnego, 
-            zapewniając chłodną i precyzyjną korektę wag BiLSTM, szanując przy tym zróżnicowane stopy 
-            uczenia poszczególnych warstw. """
-        mining_optimizer = optim.AdamW(mining_params, eps=1e-8)
+        # Zbieranie aktywnych parametrów
+        decay_params = []
+        no_decay_params = []
+        for name, param in model.named_parameters():
+            if not param.requires_grad: continue
+            if "bias" in name or "bn" in name or "norm" in name:
+                no_decay_params.append(param)
+            else:
+                decay_params.append(param)
 
-        mining_scheduler = optim.lr_scheduler.CosineAnnealingLR(mining_optimizer, T_max=5)
+        # Inicjalizacja Center Loss
+        center_criterion = CenterLoss(num_classes=num_classes, feat_dim=128, device=DEVICE)
+        
+        # Optymalizator dla samych centroidów (wymaga wyższego LR)
+        optimizer_center = optim.SGD(center_criterion.parameters(), lr=0.5)
 
-        iam_word_dataset = IAMWordDataset(
-            h5_path=IAM_WORDS_H5_PATH,
-            transform=get_augmentations("fine_tune"),
-            char_list=char_list,
-            name="IAM_HardMining",
-            split='train',
-            existing_cache=None,
-            existing_labels=None
+        # Optymalizator dla sieci (bardzo powolne, bezpieczne modyfikacje wag)
+        optimizer_align = optim.SGD([
+            {'params': decay_params, 'weight_decay': 1e-5},
+            {'params': no_decay_params, 'weight_decay': 0.0}
+        ], lr=1e-5, momentum=0.9)
+
+        # Używamy loadera z fazy fine_tune (bez agresywnych zniekształceń geometrycznych)
+        train_loader_align = DataLoader(
+            fine_tune_dataset, batch_size=BATCH_SIZE, num_workers=WORKERS_FINE,
+            collate_fn=collate_fn_dynamic, pin_memory=False, worker_init_fn=worker_init_fn, shuffle=True
         )
 
-        iam_loader = DataLoader(
-            iam_word_dataset,
-            batch_size=16,
-            shuffle=True,
-            num_workers=0, 
-            collate_fn=collate_fn_dynamic,
-            pin_memory=False
-        )
+        for epoch in range(EPOCHS_ALIGN):
+            current_total_epoch = EPOCHS_MAIN + EPOCHS_FINE_TUNE + epoch + 1
+            tqdm.write(f"[{now()}] Epoka {current_total_epoch} Alignment")
+            
+            # Włączamy tryb train, ale wymuszamy Dropout na poziomie 0.1, żeby utrzymać stabilność
+            model.set_dropout(0.1)
 
-        polish_retention_loader = DataLoader(
-            train_polish, 
-            batch_size=8, 
-            shuffle=True, # Losowe polskie znaki z generatora
-            num_workers=0,
-            collate_fn=collate_fn_dynamic, 
-            pin_memory=False
-        )
-
-        # Inicjalizacja
-        best_combined_loss = float('inf')
-
-        for epoch in range(EPOCHS_HARD_MINING):
-            tqdm.write(f"[{now()}] Hard Mining Epoka {epoch + 1}/{EPOCHS_HARD_MINING}")
-
-            # Zamrażamy BN w ResNecie — szlifujemy tylko wagi, nie chcemy psuć statystyk batcha
-            model.train()
-            for m in model.cnn.modules():
-                if isinstance(m, nn.BatchNorm2d):
-                    m.eval()
-
-            # Trening z OHEM
-            train_loss, current_hard_pool, _, _ = train_one_epoch(
-                model,
-                cvl_train_loader,
-                mining_optimizer,
-                scaler,
-                DEVICE,
-                encoder,
-                cat_weights=dynamic_weights_map,
-                scheduler=mining_scheduler,
-                epoch=epoch,
-                is_hard_mining=True,
-                use_focal=False,
-                acc_steps=ACCUMULATION_STEPS_LINES,
-                blank_penalty=0.4,
-                label_smoothing=0.02,  # Małe wygładzanie dla stabilności
+            # Wywołanie ze stratami pomocniczymi do przemodelowania dla CapsNet
+            train_loss, _, _ = train_one_epoch(
+                model, train_loader_align, optimizer_align, scaler, DEVICE, encoder, 
+                cat_weights=dynamic_weights_map, scheduler=None, # Brak schedulera - stały, niski LR
+                epoch=current_total_epoch, label_smoothing=0.01, focal_gamma=1.2, 
+                use_focal=True, acc_steps=ACCUMULATION_STEPS_FINE,
+                use_contrastive=True,
+                center_criterion=center_criterion,
+                optimizer_center=optimizer_center,
+                lambda_center=0.05,                      # Siła przyciągania klas
+                lambda_separation=0.1,                   # Siła odpychania klas
+                writer=writer
             )
 
-            if current_hard_pool and len(current_hard_pool) > 0:
-                execute_hybrid_ohem_phase(
-                    model=model,
-                    optimizer=mining_optimizer,
-                    scaler=scaler,
-                    encoder=encoder,
-                    device=DEVICE,
-                    hard_samples=current_hard_pool,
-                    iam_loader=iam_loader,
-                    polish_loader=polish_retention_loader
-                )
+            # Szybka walidacja, by upewnić się, że CTC Loss nie rośnie
+            val_loss = evaluate_loss_only(model, val_loader, DEVICE, encoder)
+            tqdm.write(f"          Align Loss: {val_loss:.4f} | Aux (Center/Sep) Aktywne")
 
-            mining_scheduler.step()
+        # Zapis finalnego, przygotowanego pod CapsNet modelu
+        final_aligned_path = os.path.join(CHECKPOINT_FOLDER, "CRNN_Aligned_for_CapsNet.pth")
+        torch.save({
+            'model_state': model.state_dict(),
+            'best_loss': val_loss,
+            'epoch': EPOCHS_MAIN + EPOCHS_FINE_TUNE + EPOCHS_ALIGN
+        }, final_aligned_path)
 
-            # Po fazie optymalizacji miningu przywracamy śledzenie statystyk przed ewaluacją
-            for m in model.cnn.modules():
-                if isinstance(m, nn.BatchNorm2d):
-                    m.train()
+        # Nadpisujemy także CER_PATH, żeby eksport używał tej wersji
+        torch.save({
+            'model_state': model.state_dict(),
+            'best_loss': val_loss,
+            'epoch': EPOCHS_MAIN + EPOCHS_FINE_TUNE + EPOCHS_ALIGN
+        }, CER_PATH)
 
-            # Pełna Ewaluacja
-            cvl_loss = evaluate_loss_only(model, cvl_val_loader, DEVICE, encoder)
-            iam_loss = evaluate_loss_only(model, iam_val_loader, DEVICE, encoder)
+        with open(ALIGNMENT_COMPLETE_FILE, 'w') as f:
+            f.write(f"Zakończono: {time.ctime()}")
 
-            avg_loss = (cvl_loss + iam_loss) / 2.0
-            avg_cer = 0.0  # Placeholder dla statystyk epoki
-
-            # Zapis do historii
-            epoch_stats = {
-                'epoch': epoch + 1,
-                'train_loss': train_loss,
-                'cvl': {'loss': cvl_loss, 'cer': 0.0, 'wer': 0.0},
-                'iam': {'loss': iam_loss, 'cer': 0.0, 'wer': 0.0},
-                'avg_loss': avg_loss,
-                'avg_cer': avg_cer,
-                'hard_samples_found': len(current_hard_pool)
-            }
-            hard_mining_history.append(epoch_stats)
-
-            # Logowanie do TensorBoard
-            if writer:
-                writer.add_scalar("HardMining/CombinedLoss", avg_loss, epoch)
-                writer.flush()
-
-            # Zapisywanie najlepszego modelu
-            if avg_loss < best_combined_loss:
-                best_combined_loss = avg_loss
-
-                checkpoint_path = os.path.join(CHECKPOINT_FOLDER, f"crnn_checkpoint_e{epoch + 1}_loss{avg_loss:.4f}.pth")
-                torch.save({
-                    'model_state': model.state_dict(),
-                    'epoch': epoch + 1,
-                    'history': hard_mining_history,
-                    'metrics': {'cer': avg_cer, 'loss': avg_loss}
-                }, checkpoint_path)
-                save_status = f" Zapisano (Loss: {avg_loss:.4f})"
-            else:
-                save_status = " Brak zapisu (Wzrost błędu)"
-
-            tqdm.write(f"      CVL - Loss: {cvl_loss:.4f}")
-            tqdm.write(f"      IAM - Loss: {iam_loss:.4f}")
-            tqdm.write(f"       └─> {save_status}")
-
-            # Monitorowanie przeuczenia
-            if 'initial_line_loss' not in globals():
-                globals()['initial_line_loss'] = cvl_loss
-                globals()['initial_word_loss'] = iam_loss
-                globals()['best_efficiency_score'] = 0.0
-
-            init_line = globals()['initial_line_loss']
-            init_word = globals()['initial_word_loss']
-
-            # Obliczamy deltę (ile poprawiliśmy/pogorszyliśmy od startu Hard Miningu)
-            line_improvement = init_line - cvl_loss
-            word_degradation = iam_loss - init_word
-
-            # Obliczamy wskaźnik efektywności
-            if word_degradation <= 0:
-                efficiency_score = float('inf')
-            else:
-                efficiency_score = line_improvement / word_degradation
-
-            if epoch != 0:
-                tqdm.write(f" Zysk: {line_improvement:.2f} | Strata: {word_degradation:.2f} | Efektywność: {efficiency_score:.2f}")
-
-            # Jeśli strata jakości na IAM, a zysk na CVL jest znikomy przez 2 epoki — zatrzymujemy trening
-            if epoch > 2:
-                if word_degradation > 0 and efficiency_score < 2.0:
-                    tqdm.write(
-                        f"[{time.strftime('%H:%M:%S')}] Niska efektywność nauki. Dalszy trening psuje model ogólny.")
-                    break
-
-                # Jeśli błąd na IAM wzrośnie o więcej niż 2 odchylenia standardowe to model przeucza się pod CVL
-                if word_degradation > (init_word * 0.15):
-                    tqdm.write(f"[{time.strftime('%H:%M:%S')}] Krytyczna utrata generalizacji (IAM Loss > 15%).")
-                    break
-
-    # Wyłączamy po zakończeniu fazy hard-mining
-    if hasattr(model.cnn, 'gradient_checkpointing_disable'):
-        model.cnn.gradient_checkpointing_disable()
-        tqdm.write(f"[{now()}] Gradient Checkpointing WYŁĄCZONY.")
-
-    # Finalny zapis historii
-    save_path = os.path.join(CHECKPOINT_FOLDER, "hard_mining_history.json")
-    with open(save_path, "w") as f:
-        json.dump(hard_mining_history, f, indent=4)
-
-    # Znacznik zakończenia fazy Hard Mining
-    with open(HARD_MINING_COMPLETE_FILE, 'w') as f:
-        f.write("complete")
+        tqdm.write(f"[{now()}] Faza Pre-CapsNet Alignment zakończona sukcesem. Przestrzeń cech została rozseparowana.")
+        
+        # Czyszczenie pamięci
+        del train_loader_align, optimizer_align, optimizer_center, center_criterion
+        gc.collect()
+        torch.cuda.empty_cache()
 
     # Eksport dla CapsNet i raport
     if os.path.exists(FINE_COMPLETE_FILE):
-        # Wzorzec wyszukiwania
-        hm_pattern = os.path.join(CHECKPOINT_FOLDER, "crnn_checkpoint_e*_loss*.pth")
-        hm_files = glob.glob(hm_pattern)
-        
-        best_hm_model = None
-        if hm_files:
-            try:
-                # Sortujemy rosnąco: im mniejszy loss, tym lepszy model
-                hm_files.sort(key=lambda x: float(re.findall(r"loss(\d+\.\d+)", x)[0]))
-                best_hm_model = hm_files[0]
-                tqdm.write(f"[{now()}] Wybrano najlepszy model Hard Mining: {os.path.basename(best_hm_model)}")
-            except Exception:
-                # Najnowszy plik, jeśli nazwa nie pasuje do wzorca
-                hm_files.sort(key=os.path.getmtime, reverse=True)
-                best_hm_model = hm_files[0]
-
-        # Definiujemy ścieżkę do załadowania
-        if best_hm_model and os.path.exists(best_hm_model):
-            final_model_path = best_hm_model
-            tqdm.write(f"[{now()}] SUKCES: Eksport na podstawie najlepszego modelu Hard Mining: {os.path.basename(final_model_path)}")
-        elif os.path.exists(FINAL_MODEL_LINES_PATH):
-            final_model_path = FINAL_MODEL_LINES_PATH
-            tqdm.write(f"[{now()}] Eksport na podstawie modelu HCR na poziomie linii (CVL + IAM).")
-        else:
-            final_model_path = CER_PATH
-            tqdm.write(f"[{now()}] UWAGA: Brak wag z Hard Miningu. Fallback do najlepszego modelu bazowego (SWA/IAM).")
+        # Fallback do najlepszego modelu z fazy Fine-Tune
+        final_model_path = CER_PATH
+        tqdm.write(f"[{now()}] SUKCES: Rozpoczynam eksport na podstawie modelu: {os.path.basename(final_model_path)}")
 
         # Ładowanie wag do modelu
         model.load_weights(final_model_path)
         model.eval()
 
-        # Łączymy obie bazy linii do ostatecznego raportu i ekstrakcji
-        val_line_transform = alb.Compose([
-            alb.Normalize(mean=EMNIST_MEAN, std=EMNIST_STD),
-            ToTensorV2()
-        ])
-
-        cvl_val_dataset = CVLLineDataset(CVL_H5_PATH, val_line_transform, char_list, split='val')
-        iam_lines_val_dataset = CVLLineDataset(IAM_LINES_H5_PATH, val_line_transform, char_list, split='val')
-        full_line_export_dataset = ConcatDataset([cvl_val_dataset, iam_lines_val_dataset])
-
-
+        # Używamy zbioru słów
         export_loader = DataLoader(
-            full_line_export_dataset,
-            batch_size=BATCH_SIZE_LINES,
+            val_dataset, 
+            batch_size=BATCH_SIZE,
             shuffle=False,
-            collate_fn=collate_fn_dynamic,
-            num_workers=WORKERS_HARD_MINING
+            collate_fn=collate_fn_dynamic, # Używamy funkcji collate dla słów
+            num_workers=WORKERS_MAIN
         )
 
         tqdm.write(f"[{now()}] Analiza pomyłek i eksport wycinków dla CapsNet.")
@@ -4336,56 +3794,50 @@ if __name__ == "__main__":
         with open(os.path.join(CAPSNET_DATA_DIR, "crnn_error_analysis.json"), "w") as f:
             json.dump({'char_true': char_true, 'char_pred': char_pred}, f)
 
-        # Generowanie macierzy pomyłek
-        flat_true = [str(c) for t in char_true for c in t]
-        flat_pred = []
-        for p in char_pred:
-            if isinstance(p, (list, tuple, str)):
-                for c in p:
-                    flat_pred.append(str(c))
-            else:
-                # Jeśli trafił się float lub coś innego, traktujemy to jako pusty znak
-                continue
+        # char_true i char_pred są już płaskimi listami stringów
+        flat_true = [str(c) for c in char_true]
+        flat_pred = [str(c) for c in char_pred]
 
-        plot_confusion_heatmap(flat_true, flat_pred, "Macierz pomyłek CRNN (Linie)", "confusion_matrix_lines.png", overwrite=True)
+        plot_confusion_heatmap(flat_true, flat_pred, "Macierz pomyłek CRNN (Słowa)", "confusion_matrix_words.png", overwrite=True)
 
         # Zbieranie danych do raportu CER/WER i niepewności
         results_for_report = []
         with torch.no_grad():
             for batch in tqdm(export_loader, desc="Generowanie raportu"):
                 if batch is None: continue
-                imgs, lbls, _, _ = batch
-                output = model(imgs.to(DEVICE))
+                # Dekompozycja batcha ze standardowego collate_fn_dynamic
+                imgs = batch[0].to(DEVICE)
+                lbls = batch[1]
+                
+                output = model(imgs)
                 lp = output[0] if isinstance(output, (tuple, list)) else output
+                
+                # Zapewnienie stałego wymiaru czasu dla dekodera
+                if float(lp.shape[0]) == float(imgs.size(0)):
+                    lp = lp.permute(1, 0, 2)
+                    
                 preds_strings, _ = encoder.decode_greedy(lp)
 
-                for gt, pred, logit in zip(lbls, preds_strings, lp.permute(1, 0, 2)):
+                # Dla wygody analizy niepewności, permutujemy z powrotem na [Batch, Time, Class]
+                lp_b = lp.permute(1, 0, 2)
+                for gt, pred, logit in zip(lbls, preds_strings, lp_b):
                     results_for_report.append({
                         'gt': str(gt), 'pred': str(pred),
                         'dist': edit_distance(str(gt), str(pred)),
-                        'uncertain': len(model.get_uncertainty_zones(logit.unsqueeze(1))) > 0
+                        'uncertain': len(model.get_uncertainty_zones(logit.unsqueeze(1), margin_threshold=0.4, conf_threshold=0.85)) > 0
                     })
 
-        # Wykresy
+        # Wykresy (Mapy uwagi)
         try:
-            # Pobieramy paczkę danych
             sample_batch = next(iter(export_loader))
-
             if sample_batch is not None and len(sample_batch) > 0:
-                device = next(model.parameters()).device
-
-                # Zakładamy, że batch[0] to obrazy, batch[1] to etykiety
                 images = sample_batch[0]
-                sample_img = images[0].unsqueeze(0).to(device)
-
+                sample_img = images[0].unsqueeze(0).to(DEVICE)
                 attn_save_path = os.path.join(VISUAL_DEBUG_DIR, "sample_attention_map.png")
-
-                # Generowanie mapy
                 visualize_attention_map(model, sample_img, attn_save_path)
                 tqdm.write(f"[{now()}] Wygenerowano przykładową mapę uwagi w: {attn_save_path}")
             else:
                 tqdm.write(f"[{now()}] Warning: export_loader zwrócił pusty batch.")
-
         except StopIteration:
             tqdm.write(f"[{now()}] Błąd: export_loader jest pusty (brak danych do wizualizacji).")
         except RuntimeError as re:
@@ -4400,16 +3852,14 @@ if __name__ == "__main__":
 
         # Generacja raportu końcowego
         generate_final_report(results=results_for_report,
-                              output_path=os.path.join(CHECKPOINT_FOLDER, "final_thesis_report_lines.txt"),
-                              plot_path=os.path.join(VISUAL_DEBUG_DIR, "uncertainty_coverage_chart_lines.png"))
+                              output_path=os.path.join(CHECKPOINT_FOLDER, "final_thesis_report_words.txt"),
+                              plot_path=os.path.join(VISUAL_DEBUG_DIR, "uncertainty_coverage_chart_words.png"))
 
-        # Metryki TTA
         tqdm.write(f"[{now()}] Liczenie szczegółowych metryk (Character/Word Error Rate dla słów).")
-        
-        # Zmiana zbioru na val_dataset, aby poprawnie podzielić na short/medium/long
+
+        # Możemy użyć tego samego loadera, ładując go element po elemencie do dokładnych statystyk
         detailed_loader = DataLoader(val_dataset, batch_size=1, collate_fn=collate_fn_dynamic)
         detailed_results = evaluate_full_metrics(model, detailed_loader, DEVICE, encoder)
-
         with open(os.path.join(CHECKPOINT_FOLDER, "final_metrics_report_words.json"), "w") as f:
             json.dump(detailed_results, f)
 
@@ -4419,21 +3869,27 @@ if __name__ == "__main__":
 """ cd /home/marek/OCR/HandwrittenTextRecognition
     export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
     docker system prune -a -f
-    sudo docker compose down && sudo docker compose up -d
     docker build -t hcr-resnet-crnn .
+    sudo docker compose down && sudo docker compose up -d --build
     docker run -it --rm --name trening_test \
   --gpus all \
+  --ipc=host \
+  --network=host \
   -e PYTHONUNBUFFERED=1 \
-  -v /home/marek/OCR/HandwrittenTextRecognition/Data:/app/Data \
+  -v /home/marek/OCR/HandwrittenTextRecognition/Data:/app/Data:rw \
   -v /home/marek/OCR/HandwrittenTextRecognition/output_data:/app/output_data \
   -v /home/marek/OCR/HandwrittenTextRecognition/Models:/app/Models \
   --shm-size=16gb \
   hcr-resnet-crnn \
-  python3 /app/Models/ResNetCRNNWordRecognition.py
+  python3 -B Models/ResNetCRNNWordRecognition.py
   
     -it logi na żywo, --rm usuwanie kontenera od razu po przerwaniu
     --name nazwa kontenera, --gpus all wszystkie dostępne rdzenie GPU,   
     -e PYTHONBUFFERED = 1 wypisywanie logów w czasie rzeczywistym
     -v mapuje lokalny folder do kontenera pod podaną ścieżkę
-    --shm-size - rozmiar pamięci współdzielonej, duży bo wątki przetwarzają np. cvl_lines
+    --shm-size - rozmiar pamięci współdzielonej, duży bo wątki przetwarzają obrazy słów
+    --ipc=host - bezpośredni dostęp do pamięci współdzielonej hosta, brak opóźnień DataLoader -> GPU
+    --network=host - bezpośredni dostęp do sieci hosta, szybsze logowanie metryk (np. TensorBoard/W&B)
+    :ro (przy Data) - tryb tylko do odczytu, szybsze ładowanie tysięcy małych plików (brak sprawdzania zapisu)
+    -B (przy python3) - blokuje tworzenie plików .pyc, brak śmieci w zmapowanych folderach lokalnych
     python3... komenda startująca wewnątrz kontenera """
