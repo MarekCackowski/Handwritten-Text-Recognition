@@ -228,7 +228,6 @@ def now():
     return time.strftime('%H:%M:%S')
 
 
-
 class ScRN_STN(nn.Module):
     """ Symmetric Character Rectification Network oparte na TPS.
         Automatycznie dostosowuje siatkę wyjściową do rozmiarów obrazu wejściowego, zapobiegając niszczeniu proporcji krótkich słów. 
@@ -277,7 +276,8 @@ class ScRN_STN(nn.Module):
         self._build_inverse_matrix()
 
     def _build_inverse_matrix(self):
-        margin = 0.15
+        # Zmniejszone do 0.05, żeby model nie ucinał końcówek
+        margin = 0.05
         N = self.F
 
         x_coords = torch.linspace(-1 + margin, 1 - margin, N // 2)
@@ -327,8 +327,10 @@ class ScRN_STN(nn.Module):
         params = self.fc_loc(features)
         params = params.view(B, self.F // 2, 4)
 
-        c_x, c_y = params[:, :, 0], params[:, :, 1]
-        s_cos, s_sin = params[:, :, 2], params[:, :, 3]
+        c_x = torch.tanh(params[:, :, 0]) * 0.1
+        c_y = torch.tanh(params[:, :, 1]) * 0.1
+        s_cos = torch.tanh(params[:, :, 2]) * 0.1
+        s_sin = torch.tanh(params[:, :, 3]) * 0.1
 
         delta_top = torch.stack([c_x + s_cos, c_y - s_sin], dim=2)
         delta_bottom = torch.stack([c_x - s_cos, c_y + s_sin], dim=2)
@@ -360,7 +362,7 @@ class VisualAttention(nn.Module):
         1. Wejście: Mapa cech z ResNet.
         2. Analiza: Warstwa konwolucyjna ocenia ważność każdego piksela.
         3. Filtracja: Softmax normalizuje wagi wzdłuż wymiaru wysokości.
-        4. Wyjście: Ważona suma cech – sekwencja 1D gotowa dla GRU. """
+        4. Wyjście: Ważona suma cech - sekwencja 1D gotowa dla GRU. """
     def __init__(self, channels):
         super(VisualAttention, self).__init__()
         self.attn = nn.Conv2d(channels, 1, kernel_size=1, bias=False)
@@ -471,37 +473,65 @@ class EnhancedBiLSTM(nn.Module):
         self.lstm.flatten_parameters() 
         output, hidden = self.lstm(x)
 
+        # Aktywacja layer_norm dla stabilizacji wyjścia z sieci rekurencyjnej
+        output = self.layer_norm(output)
+
         return output, hidden
 
-class WindowedAttention(nn.Module):
-    """ Okienkowy mechanizm uwagi wykorzystujący maskę diagonalną. 
-        Zamiast sztywno ciąć sekwencję, tworzy płynne, nakładające się okno (Sliding Window), 
-        gdzie każdy znak widzi tylko swoje najbliższe sąsiedztwo. """
-    def __init__(self, d_model, num_heads=8, window_size=32, adaptive_threshold=True):
+
+class PositionalEncoding(nn.Module):
+    """ Wstrzykuje informację o kolejności znaków dla mechanizmów Atencji. """
+    def __init__(self, d_model, max_len=2000):
         super().__init__()
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        self.register_buffer('pe', pe.unsqueeze(1)) # Kształt: [max_len, 1, d_model]
+
+    def forward(self, x):
+        # x ma kształt: [Kroki_Czasowe, Batch, Kanały]
+        return x + self.pe[:x.size(0)]
+    
+
+class WindowedAttention(nn.Module):
+    """ Okienkowy mechanizm uwagi wykorzystujący maskę diagonalną. Zamiast sztywno ciąć sekwencję,
+        tworzy płynne, nakładające się okno, gdzie każdy znak widzi tylko swoje najbliższe sąsiedztwo. 
+        Przekazuje, także informacje o pozycji, żeby sieć radziła sobie z chronologią. """
+    def __init__(self, d_model, num_heads=8, window_size=32):
+        super().__init__()
+        self.pos_encoder = PositionalEncoding(d_model) # Inicjalizacja GPS-a
         self.mha = nn.MultiheadAttention(d_model, num_heads)
         self.window_size = window_size
+        self.norm = nn.LayerNorm(d_model)
 
     def forward(self, x):
         t, b, c = x.size()
+        res = x 
 
-        # Jeśli sekwencja jest krótka, używamy globalnej uwagi
+        # Wstrzyknięcie świadomości przestrzennej do wektorów
+        x_pe = self.pos_encoder(x)
+
         if t <= self.window_size:
-            attn_out, _ = self.mha(x, x, x)
-            return attn_out
+            # Uwaga liczy podobieństwo na podstawie zakodowanych pozycji
+            attn_out, _ = self.mha(x_pe, x_pe, x_pe)
+            return self.norm(res + attn_out)
 
-        # Tworzymy maskę: True oznacza zablokowaną atencję
         idx = torch.arange(t, device=x.device).unsqueeze(1)
         dist = torch.abs(idx - idx.t())
         attn_mask = dist > self.window_size 
 
-        # PyTorch MHA automatycznie ignoruje relacje tam, gdzie attn_mask jest True
-        attn_out, _ = self.mha(x, x, x, attn_mask=attn_mask)
-
-        return attn_out
+        attn_out, _ = self.mha(x_pe, x_pe, x_pe, attn_mask=attn_mask)
+        # Dodałem res +, żeby nie sieć nie zapominała
+        return self.norm(res + attn_out)
 
 
 class SpatialDropout1D(nn.Module):
+    """ W przeciwieństwie do standardowego dropoutu, który losowo zeruje pojedyncze aktywacje,
+        ta warstwa wyłącza całe kanały cech na całej ich długości w danej sekwencji. 
+        Wymusza to na modelu uczenie się niezależnych, bardziej odpornych reprezentacji znaków, 
+        co redukuje przeuczenie na specyficznych, powtarzalnych stylach pisma odręcznego. """
     def __init__(self, p=0.3):
         super(SpatialDropout1D, self).__init__()
         # nn.Dropout1d wyłącza całe kanały
@@ -583,12 +613,16 @@ class ResNetCRNN(nn.Module):
         # Uproszczona projekcja (Krótszy backprop do CNN)
         self.p = 0.25
         self.projection = nn.Sequential(
-            nn.Conv2d(512, 256, kernel_size=1),
-            nn.Dropout(self.p)
+            nn.Conv1d(512, 256, kernel_size=1), # Conv1d, bo nie chcemy tworzyć wymiarów nadmiarowych
+            nn.Dropout1d(self.p) # Dropout1d dla stabilności mapy 1D
         )
         
         # Po warstwie projection mamy 256 kanałów, mapujemy je bezpośrednio na klasy znaków - CTC Shortcut omijający warstwy RNN
         self.ctc_shortcut = nn.Conv1d(256, num_classes, kernel_size=1)
+
+        # Wyzerowanie skrótu, by nie zalewał RNN szumem na starcie, wcześniej dodawaliśmy logity bezpośrednio do wyjścia uniemożliwiając naukę
+        nn.init.zeros_(self.ctc_shortcut.weight)
+        nn.init.zeros_(self.ctc_shortcut.bias)
 
         # Modelowanie sekwencji
         self.rnn = EnhancedBiLSTM(256, 512, num_layers=2)
@@ -625,35 +659,35 @@ class ResNetCRNN(nn.Module):
         # Ekstrakcja cech (ResNet + CRAM)
         x = self.cnn(stn_img)
 
-        # Visual Attention Pooling - bezpieczniejsza redukcja wymiaru 2
+        # Visual Attention Pooling - bezpieczniejsza redukcja wymiaru 2 -> Wynik: [Batch, Channels, Width]
         x = self.attention(x)
         if x.dim() == 4:
-            x = torch.mean(x, dim=2)  # Zamiast squeeze(2), uśredniamy wysokość do 1
+            x = torch.mean(x, dim=2) 
+            
+        # Aplikacja Spatial Dropout
+        x = self.spatial_drop(x)
 
-        # Adaptacyjna atencja okienkowa (dla linii)
-        x = x.permute(2, 0, 1)
+        # Adaptacyjna atencja okienkowa (dla długich linii)
+        x = x.permute(2, 0, 1) # -> [Width, Batch, Channels]
         if x.size(0) > 128:
             x = self.self_attn(x)
 
-        x = x.permute(1, 2, 0).unsqueeze(2)
+        # Powrót do [Batch, Channels, Width] dla projekcji 1D
+        x = x.permute(1, 2, 0).contiguous()
 
-        # Upewniamy się, że tensor jest kontynuowalny dla operacji na GPU (traci ciągłość przy zmianie wymiarów)
-        x = x.contiguous()
-
-        # Projekcja do BiLSTM
+        # Projekcja do wejścia BiLSTM (natywne 1D)
         x = self.projection(x)
+        
+        # Ekstrakcja skrótu CTC (wymaga [Width, Batch, Classes])
+        shortcut_logits = self.ctc_shortcut(x).permute(2, 0, 1).float()
 
-        # Przygotowujemy tensor o wymiarach [Batch, Channels, Width]
-        if x.dim() == 4:
-            x = x.mean(dim=2)
-
-        # Permute(2, 0, 1) zamienia go na [Width, Batch, Channels] - dla RNN
-        x = x.permute(2, 0, 1).float()
+        # Permute na [Width, Batch, Channels] - dla RNN
+        x_rnn = x.permute(2, 0, 1).float()
 
         with torch.amp.autocast('cuda', enabled=False):
-            # Rozpakowujemy rnn_output i zwracamy surowe logity
-            recurrent_features, *_ = self.rnn(x)
-            log_probs = self.output(recurrent_features)
+            recurrent_features, *_ = self.rnn(x_rnn)
+            # Dodajemy logity ze skrótu do ostatecznych logitów RNN
+            log_probs = self.output(recurrent_features) + shortcut_logits
 
         # Routing tensorów
         if return_stn and return_context:
@@ -717,15 +751,21 @@ class ResNetCRNN(nn.Module):
     def set_dropout(self, p):
         self.p = p
         for module in self.projection:
-            if isinstance(module, nn.Dropout2d):
+            if isinstance(module, nn.Dropout1d):
                 module.p = p
 
     def estimate_uncertainty(self, x, steps=10):
         self.eval()
+        
+        # Aktywacja warstw Dropout dla Monte Carlo Dropout pomimo trybu eval()
+        for m in self.modules():
+            if m.__class__.__name__.startswith('Dropout'):
+                m.train()
+                
         outputs = []
         for _ in range(steps):
             with torch.no_grad():
-                logits = self.forward(x, force_dropout=True)
+                logits = self.forward(x)
                 outputs.append(torch.softmax(logits[0], dim=-1))
 
         variance = torch.stack(outputs).var(dim=0)
@@ -808,7 +848,6 @@ class AdvancedHTRAugmentor:
         if image is None or image.size == 0:
             return image
 
-        # Zabezpieczenie: jeśli obraz jest zbyt mały, pomijamy augmentację
         h, w = image.shape[:2]
         phantom_h = int(h * 0.15)
         if phantom_h < 2:
@@ -820,13 +859,20 @@ class AdvancedHTRAugmentor:
             cv.ellipse(phantom, (x, phantom_h), (random.randint(5, 12), 4), 
                        random.randint(0, 30), 0, 360, (255), -1)
 
-        # Obliczenie rzeczywistej wysokości do wklejenia (zabezpieczenie przed index out of bounds)
         actual_ph = min(phantom_h, h)
-        
-        if random.random() > 0.5:
-            image[:actual_ph, :] = cv.bitwise_or(image[:actual_ph, :], phantom[:actual_ph, :])
+
+        if image.ndim == 3:
+            # Jeśli mamy 3 wymiary (H, W, C), operujemy na kanale 0
+            if random.random() > 0.5:
+                image[:actual_ph, :, 0] = cv.bitwise_or(image[:actual_ph, :, 0], phantom[:actual_ph, :])
+            else:
+                image[-actual_ph:, :, 0] = cv.bitwise_or(image[-actual_ph:, :, 0], np.flipud(phantom[:actual_ph, :]))
         else:
-            image[-actual_ph:, :] = cv.bitwise_or(image[-actual_ph:, :], np.flipud(phantom[:actual_ph, :]))
+            # Jeśli mamy 2 wymiary (H, W)
+            if random.random() > 0.5:
+                image[:actual_ph, :] = cv.bitwise_or(image[:actual_ph, :], phantom[:actual_ph, :])
+            else:
+                image[-actual_ph:, :] = cv.bitwise_or(image[-actual_ph:, :], np.flipud(phantom[:actual_ph, :]))
             
         return image
     
@@ -898,42 +944,41 @@ class IAMWordDataset(Dataset):
         h5_idx = self.valid_indices[idx]
         label = self.valid_labels[idx]
         
-        # Ładowanie
         img = self._load_single_h5_image(h5_idx)
         
-        # Sprawdzenie czy w ogóle mamy obraz (2D) i czy nie jest pusty
         if img is None or img.ndim < 2 or img.size == 0:
-            img = np.zeros((self.IMAGE_HEIGHT, 64), dtype=np.uint8)
-        else:
-            # Inwersja kolorów
-            if np.mean(img) > 127:
-                img = cv.bitwise_not(img)
+            return torch.zeros((1, self.IMAGE_HEIGHT, 64)), label
 
-            # Bezpieczne kadrowanie
-            coords = cv.findNonZero(img)
-            if coords is not None and coords.shape[0] > 0:
-                x, y, w_bbox, h_bbox = cv.boundingRect(coords)
-                # Sprawdzamy czy wykryto sensowny rozmiar
-                if w_bbox > 1 and h_bbox > 1:
-                    pad = int(h_bbox * 0.1)
-                    x1 = max(0, x - pad)
-                    # Używamy min/max aby uniknąć błędów indeksowania
-                    x2 = min(img.shape[1], x + w_bbox + pad)
-                    img = img[:, x1:x2]
+        # Polaryzacja (był zły znak)
+        if np.mean(img) > 127:
+            img = cv.bitwise_not(img)
 
-        # Sprawdzenie kształtu przed resize
-        if img.ndim < 2 or img.shape[0] == 0 or img.shape[1] == 0:
-            img = np.zeros((self.IMAGE_HEIGHT, 64), dtype=np.uint8)
+        # Czyszczenie
+        _, thresh = cv.threshold(img, 30, 255, cv.THRESH_BINARY)
 
-        # Skalowanie z zabezpieczeniem przed dzieleniem przez 0
+        # Kadrowanie
+        coords = cv.findNonZero(thresh)
+        if coords is not None and coords.shape[0] > 0:
+            x, y, w_bbox, h_bbox = cv.boundingRect(coords)
+            if w_bbox > 1 and h_bbox > 1:
+                pad = int(h_bbox * 0.15)
+                x1 = max(0, x - pad)
+                x2 = min(img.shape[1], x + w_bbox + pad)
+                img = img[:, x1:x2]
+
+        # Skalowanie
         h, w = img.shape[:2]
+        if h == 0 or w == 0:
+            return torch.zeros((1, self.IMAGE_HEIGHT, 64)), label
+            
         scale = self.IMAGE_HEIGHT / max(1, h)
         new_w = max(16, int(w * scale)) 
-        
-        # Resize
         img = cv.resize(img, (new_w, self.IMAGE_HEIGHT), interpolation=cv.INTER_AREA)
 
         # Transformacje
+        if img.ndim == 2:
+            img = np.expand_dims(img, axis=-1)
+            
         augmented = self.transform(image=img)
         return augmented['image'], label
         
@@ -977,7 +1022,6 @@ class IAMWordDataset(Dataset):
 
     def __len__(self):
         return self.dataset_len
-
 
 class WidthBatchSampler(Sampler):
     """  Grupowanie po szerokości obrazu, aby zminimalizować padding w batchu.
@@ -1195,7 +1239,7 @@ def get_augmentations(phase):
 
             # Imitowanie szumu i nieostrości obiektywu
             alb.OneOf([
-                alb.GaussNoise(std_range=(0.01, 0.05), p=1.0),
+                alb.GaussNoise(var_limit=(10.0, 50.0), p=1.0),
                 alb.MultiplicativeNoise(multiplier=(0.95, 1.05), p=1.0),
             ], p=0.2),
 
@@ -1237,7 +1281,7 @@ def get_augmentations(phase):
 
             # Drobny szum lub lekkie nieostrości obiektywu
             alb.OneOf([
-                alb.GaussNoise(std_range=(0.01, 0.05), p=1.0),
+                alb.GaussNoise(var_limit=(5.0, 20.0), p=1.0),
                 alb.GaussianBlur(blur_limit=(3, 3), p=1.0),
             ], p=0.1),
 
@@ -1326,13 +1370,18 @@ def collate_fn_dynamic(batch):
     batch = [item for item in batch if item is not None]
     if len(batch) == 0: return None
 
-    # Walidacja batcha + Odrzucenie próbek ze spacją
+    # Walidacja batcha + bezpieczne czyszczenie i usuwanie spacji brzegowych
     valid_batch = []
     for item in batch:
         if torch.is_tensor(item[0]) and item[0].dim() == 3:
-            label = item[1]
-            if ' ' not in label: 
-                valid_batch.append(item)
+            # Konwersja na string i obcięcie spacji brzegowych (zabezpieczenie przed wyciekami)
+            label_clean = str(item[1]).strip()
+
+            # Sprawdzamy czy tekst nie jest pusty i czy nie zawiera spacji w środku
+            if label_clean and ' ' not in label_clean: 
+                new_item = list(item)
+                new_item[1] = label_clean
+                valid_batch.append(tuple(new_item))
                 
     if not valid_batch: return None
 
@@ -1341,30 +1390,30 @@ def collate_fn_dynamic(batch):
     categories = [item[2] if len(item) > 2 else 'short' for item in valid_batch]
     extras = list(zip(*[item[3:] for item in valid_batch])) if any(len(item) > 3 for item in valid_batch) else []
 
-    # Obliczamy wartość tła do paddingu
+    # Obliczamy wartość tła do paddingu na podstawie globalnych statystyk nowej normalizacji
     bg_val = (0.0 - float(IAM_MEAN[0])) / float(IAM_STD[0])
 
-    # Przetwarzamy obrazy
+    # Przetwarzamy obrazy pod kątem fizycznych wymagań sieci i CTC Loss
     processed_imgs = []
     for img, label in zip(imgs, labels):
         current_w = int(img.shape[-1])
 
         # Zabezpieczenie dla CTC: CRNN redukuje wymiary. Obraz musi mieć fizycznie miejsce na wyplucie wszystkich znaków.
-        min_w_needed = len(label) * 16
+        min_w_needed = len(label) * 48
 
-        # Jeśli obraz jest skrajnie nienaturalnie ściśnięty, rozszerzamy go od razu
+        # Jeśli obraz jest skrajnie nienaturalnie ściśnięty, rozszerzamy go od razu w prawo
         if current_w < min_w_needed:
             pad_right = min_w_needed - current_w
             img = torch.nn.functional.pad(img, (0, pad_right), value=bg_val)
             current_w = min_w_needed
 
-        # Zakładam, że 2048 to cała linia
+        # Ograniczenie maksymalnej szerokości do stabilnego limitu
         if current_w > 2048:
             img = img[:, :, :2048]
 
         processed_imgs.append(img)
 
-    # Szukamy najszerszego słowa w tym batchu
+    # Szukamy najszerszego słowa w tym konkretnym batchu
     batch_max_w = max(int(img.shape[-1]) for img in processed_imgs)
 
     """ Zapisujemy informacje o oryginalnej szerokości przed nałożeniem paddingu. Dzięki temu funkcja CTC Loss wie,
@@ -1376,7 +1425,7 @@ def collate_fn_dynamic(batch):
         curr_w = int(img.shape[-1])
         pad_right = batch_max_w - curr_w
 
-        # Wyrównanie wszystkich słów do prawej krawędzi (do najdłuższego w batchu)
+        # Wyrównanie wszystkich słów do prawej krawędzi (do najdłuższego w batchu) za pomocą wartości znormalizowanego tła
         if pad_right > 0:
             padded_img = torch.nn.functional.pad(img, (0, pad_right), value=bg_val)
         else:
@@ -1386,7 +1435,7 @@ def collate_fn_dynamic(batch):
     padded = torch.stack(padded_imgs)
 
     if extras:
-        return padded, labels, categories, *[list(field) for field in extras]
+        return padded, labels, categories, original_widths, *[list(field) for field in extras]
 
     return padded, labels, categories, original_widths
 
@@ -1550,14 +1599,17 @@ def inter_class_separation_loss(features, labels, margin=0.5):
     label_map = (labels.unsqueeze(1) == unique_labels).float()
     mapped_labels = label_map.argmax(dim=1)
     
-    # Obliczanie centrów: Suma cech podzielona przez zliczenia
-    counts = torch.bincount(mapped_labels, minlength=n_classes).float().view(-1, 1)
-    sum_features = torch.zeros(n_classes, features.size(1), device=device)
+    # Obliczanie centrów
+    counts = torch.bincount(mapped_labels, minlength=n_classes).to(features.dtype).view(-1, 1)
+    
+    # Inicjalizacja
+    sum_features = torch.zeros(n_classes, features.size(1), dtype=features.dtype, device=device)
     sum_features.scatter_add_(0, mapped_labels.unsqueeze(1).expand(-1, features.size(1)), features)
     centers = sum_features / counts.clamp(min=1)
 
-    # Odległości
-    distances = torch.cdist(centers, centers, p=2)
+    # Rzutowanie na float32 przed cdist (unikamy błędów numerycznych dla bfloat16 w tej operacji)
+    centers_fp32 = centers.float()
+    distances = torch.cdist(centers_fp32, centers_fp32, p=2)
 
     # Penalty tylko dla par
     mask = torch.triu(torch.ones(n_classes, n_classes, device=device), diagonal=1).bool()
@@ -1960,7 +2012,10 @@ def train_one_epoch(model, loader, optimizer, scaler, device, encoder, cat_weigh
                     actual_cat = 'long'
                     
                 valid_batch_data.append((img, lbl_clean, actual_cat))
-                valid_input_lengths.append(w // 32)
+
+                """ W trakcie treningu sieci zmniejszamy szerokość 2 razy, łącznie 4-krotnie,
+                    żeby model widział wąskie znaki. """
+                valid_input_lengths.append(w // 4)
 
             # Zabezpieczenie przed pustym batchem po filtracji
             if not valid_batch_data: continue
@@ -1986,7 +2041,7 @@ def train_one_epoch(model, loader, optimizer, scaler, device, encoder, cat_weigh
 
             # Forward pass z wykorzystaniem AMP
             with torch.amp.autocast('cuda', enabled=(scaler is not None), dtype=torch.bfloat16):
-                output, stn_img = model(images, return_embeddings=use_contrastive, return_stn=True)
+                output = model(images, return_embeddings=use_contrastive)
 
             # Bezpieczne rozpakowanie
             if use_contrastive:
@@ -3733,8 +3788,8 @@ if __name__ == "__main__":
                 use_contrastive=True,
                 center_criterion=center_criterion,
                 optimizer_center=optimizer_center,
-                lambda_center=0.05,                      # Siła przyciągania klas
-                lambda_separation=0.1,                   # Siła odpychania klas
+                lambda_center=0.05, # Siła przyciągania klas
+                lambda_separation=0.1, # Siła odpychania klas
                 writer=writer
             )
 
@@ -3769,7 +3824,7 @@ if __name__ == "__main__":
 
     # Eksport dla CapsNet i raport
     if os.path.exists(FINE_COMPLETE_FILE):
-        # Fallback do najlepszego modelu z fazy Fine-Tune
+        # Fallback do najlepszego modelu
         final_model_path = CER_PATH
         tqdm.write(f"[{now()}] SUKCES: Rozpoczynam eksport na podstawie modelu: {os.path.basename(final_model_path)}")
 
