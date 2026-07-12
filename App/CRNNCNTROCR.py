@@ -443,7 +443,7 @@ class VisualExplainer:
         plt.imshow(img, cmap='gray')
 
         plt.subplot(1, 2, 2)
-        plt.title("Istotność pikseli (XAI)")
+        plt.title("Istotność pikseli")
         # Nakładamy mapę atrybucji
         plt.imshow(attributions, cmap='hot')
         plt.colorbar()
@@ -960,10 +960,9 @@ class CRNNInferencePipeline:
     """ Główny koordynator procesu inferencji HTR. Klasa zarządza pełnym potokiem przetwarzania: od surowego skanu strony,
         przez segmentację i wieloetapowe rozpoznawanie, aż po interaktywną korektę. """
     def __init__(self, crnn_model, char_list, device, transformer_path=None, verbose=True):
-        # arametry sprzętowe i modele
+        # Parametry sprzętowe i modele
         self.device = device
-        self.device = device
-        self.use_fp16 = False  # Edge AI polega na CPU i INT8
+        self.use_fp16 = False
         self.model = crnn_model.to(device)
         self.model.eval()
 
@@ -973,35 +972,42 @@ class CRNNInferencePipeline:
         self.segmentor = LineToWordSegmentor()
         self.geo_corrector = GeometryCorrector()
 
-        # Mapowanie znaków
-        self.char_list = char_list
-        self.idx_to_char = {i + 1: c for i, c in enumerate(char_list)}
-        self.idx_to_char[0] = ''
-        self.char_to_idx = {v: k for k, v in self.idx_to_char.items() if v != ''}
+        # Indeks 0 to na sztywno [blank]
+        self.char_list = ['[blank]'] + [c for c in char_list if c != '[blank]']
+        self.idx_to_char = {i: c for i, c in enumerate(self.char_list)}
+        self.char_to_idx = {v: k for k, v in self.idx_to_char.items()}
 
         # Modele dodatkowe
-        self.capsnet = CapsNet(num_classes=62).to(device)
+        self.capsnet = CapsNet(num_classes=80).to(device)
         self.transformer: Optional[TransformerRefiner] = \
             TransformerRefiner(transformer_path, device) if transformer_path else None
-        self.refiner = None
+        
+        # Powiązanie kaskady poprawek CapsNet
+        self.refiner = CascadeRefinementNetwork(
+            capsnet_predictor=self.capsnet,
+            char_list=self.char_list,
+            encoder_obj=self,
+            matrix_dir=MATRIX_DIR,
+            matrix_path=MATRIX_FILE
+        )
 
         self.projector = nn.Sequential(
             nn.Linear(1024, 512),
             nn.LayerNorm(512),
             nn.GELU(),
             nn.Linear(512, 768)
-        ).to(DEVICE)
+        ).to(device)
 
         self.tuner = JointFeedbackFineTuner(
             crnn_model=self.model,
-            caps_model=self.refiner.capsnet if self.refiner else None,
+            caps_model=self.capsnet,
             transformer_model=self.transformer if hasattr(self, 'transformer') else None,
             encoder=self,
             device=self.device
         )
 
         self.ort_session = None
-        self.onnx_path = CRNN_WEIGHTS.replace(".pth", "_int8.onnx")
+        self.onnx_path = str(CRNN_WEIGHTS).replace(".pth", "_int8.onnx")
         self.load_onnx_if_exists()
 
     def _prepare_batch(self, crops):
@@ -1069,128 +1075,7 @@ class CRNNInferencePipeline:
         entropy = -torch.sum(probs * torch.log(probs + 1e-9), dim=-1)
 
         return entropy.mean().item()
-
-    def predict_single_word_refinement(self, current_probs, img_caps_single, context_map=None):
-        """ Pełna kaskada decyzyjna (Multimodal Fusion) z mechanizmem VETO. """
-        # Wstępne rozpoznanie CRNN
-        word_entropy = getattr(self, 'calculate_entropy', lambda p, T: 0.0)(current_probs, T=1.4)
-        raw_crnn_text, raw_char_confs, _, words_data = self._decode_ctc_with_mask(current_probs)
-        refined_char_confs = raw_char_confs
-        raw_word_conf = np.mean(raw_char_confs) if raw_char_confs else 0.0
-
-        attention_map_to_save = None
-        text_after_caps = raw_crnn_text
-        hybrid_word_conf = raw_word_conf
-        uncertainty_mask = [0] * len(raw_crnn_text)
-        global_visual_feat = None
-
-        # CapsNet + Kontekst
-        if self.refiner:
-            refinement_result = self.refiner.refine_logits(
-                current_probs,
-                img_caps_single,
-                crnn_text=raw_crnn_text,
-                context_map=context_map,
-                force_intensive=(raw_word_conf < 0.7),
-                return_heatmap=True
-            )
-
-            # Ekstrakcja cech dla Neuronów Typograficznych
-            if hasattr(self.refiner, 'get_global_features'):
-                global_visual_feat = self.refiner.get_global_features()
-
-            if isinstance(refinement_result, tuple) and len(refinement_result) == 3:
-                current_probs, raw_timestep_mask, attention_map_to_save = refinement_result
-            elif isinstance(refinement_result, tuple) and len(refinement_result) == 2:
-                current_probs, raw_timestep_mask = refinement_result
-            else:
-                # Wymuszamy na linterze świadomość, że to jest Tensor
-                current_probs = cast(torch.Tensor, refinement_result)
-                raw_timestep_mask = [0] * current_probs.size(0)
-
-            # Dekodowanie po poprawkach CapsNetu
-            text_after_caps, refined_char_confs, uncertainty_mask, words_data = self._decode_ctc_with_mask(current_probs, raw_timestep_mask)
-            hybrid_word_conf = np.mean(refined_char_confs) if refined_char_confs else raw_word_conf
-
-        # Generowanie kandydatów Beam Search
-        candidates = getattr(self, '_ctc_beam_search', lambda p, beam_width: [(text_after_caps, 1.0)])(
-            current_probs,
-            beam_width=5
-        )
-        scored_results = []
-
-        for cand_text, v_score in candidates:
-            # Opcjonalna korekta geometryczna
-            geo_cand = self.geo_corrector.refine_chars(cand_text, img_caps_single) if hasattr(self, 'geo_corrector') else cand_text
-
-            # Filar Językowy
-            l_score = 0.0
-            if hasattr(self, 'transformer') and self.transformer and not any(c.isdigit() for c in geo_cand):
-                # Tagowanie niepewnych fragmentów dla Transformera (<unc>)
-                tagged_text = ""
-                for idx, char in enumerate(geo_cand):
-                    char_p = refined_char_confs[idx] if idx < len(refined_char_confs) else hybrid_word_conf
-                    tagged_text += f"<unc>{char}</unc>" if char_p < 0.75 else char
-
-                l_score = self.transformer.score_text(tagged_text)
-
-            # Filar Typograficzny (Visual-Semantic Alignment)
-            t_score = 0.0
-            if self.transformer and hasattr(self.transformer, 'get_word_embeddings') and global_visual_feat is not None:
-                with torch.no_grad():
-                    vision_emb = self.projector(global_visual_feat)
-                    text_emb = self.transformer.get_word_embeddings([geo_cand])
-                    t_score = torch.nn.functional.cosine_similarity(vision_emb, text_emb).item()
-
-            # Fuzja wyników: Wizja (1,0) + Język (0,45) + Typografia (0,35)
-            combined_score = v_score + (l_score * 0.45) + (t_score * 0.35)
-
-            scored_results.append({
-                'text': geo_cand,
-                'score': combined_score,
-                'vision_score': v_score,
-                'lang_score': l_score,
-                'typo_score': t_score
-            })
-
-        # Wybranie najlepszej opcji
-        final_proposal = scored_results[0]['text'] if scored_results else text_after_caps
-
-        # Adaptacyjny próg Levenshteina dla długich linii (15% zmienionych znaków)
-        max_allowed_changes = max(2, int(len(text_after_caps) * 0.15))
-        if raw_crnn_text == text_after_caps and Levenshtein.distance(text_after_caps, final_proposal) > max_allowed_changes:
-            # Jeśli wizja jest bardzo pewna, odrzucamy zbyt agresywną korektę Transformera
-            if hybrid_word_conf > 0.90:
-                final_proposal = text_after_caps
-
-        # Obliczanie prawdopodobieństwa softmax dla top-k (do pokazania w UI)
-        top_n = scored_results[:3]
-        top_k_with_conf = []
-        if top_n:
-            raw_scores = torch.tensor([r['score'] for r in top_n], dtype=torch.float32)
-            probs_softmax = torch.softmax(raw_scores, dim=0).numpy()
-            top_k_with_conf = [
-                {'text': r['text'], 'conf': float(p)}
-                for r, p in zip(top_n, probs_softmax) if p > 0.25
-            ]
-
-        conf_gain = hybrid_word_conf - raw_word_conf
-
-        # Zwracamy pełny zestaw danych dla UI
-        return {
-            'crnn_result': raw_crnn_text,
-            'capsnet_result': text_after_caps,
-            'final_result': final_proposal,
-            'uncertainty_mask': uncertainty_mask,
-            'words_data': words_data,
-            'top_k_candidates': top_k_with_conf,
-            'word_confidence': raw_word_conf,
-            'hybrid_confidence': hybrid_word_conf,
-            'confidence_gain': conf_gain,
-            'entropy': word_entropy,
-            'attention_map': attention_map_to_save,
-            'debug_scores': scored_results if scored_results else {}
-        }
+    
 
     def predict_batch(self, tensors_crnn, tensors_caps):
         """ Główna metoda dla generatora danych. Przyjmuje listy tensorów CRNN i CapsNet. """
@@ -1201,21 +1086,16 @@ class CRNNInferencePipeline:
 
         # Jeśli ONNX
         if hasattr(self, 'ort_session') and self.ort_session is not None:
-            # Padding i stackowanie dla batcha ONNX (oczekuje numpy)
             max_w = max(t.size(-1) for t in tensors_crnn)
             padded = [func.pad(t, (0, max_w - t.size(-1)), mode='constant', value=-1.0) for t in tensors_crnn]
 
-            # Przygotowanie inputu dla ONNX Runtime
             batch_np = torch.stack(padded).cpu().numpy()
             if batch_np.ndim == 3: batch_np = np.expand_dims(batch_np, axis=1)
 
             ort_inputs = {self.ort_session.get_inputs()[0].name: batch_np}
             ort_outs = self.ort_session.run(None, ort_inputs)
 
-            # Zamiana wyniku z powrotem na tensor dla reszty potoku
             logits = torch.tensor(ort_outs[0]).to(self.device)
-
-            # ONNX nie zwraca map kontekstu
             context_maps = [None] * logits.size(1)
         else:
             max_w = max(t.size(-1) for t in tensors_crnn)
@@ -1229,9 +1109,10 @@ class CRNNInferencePipeline:
             if use_fp16: images_batch = images_batch.half()
 
             with torch.inference_mode():
+                # PyTorch zwraca [Time, Batch, Class] oraz [Batch, Time, Channels]
                 logits, context_maps = self.model(images_batch, return_context=True)
 
-        # Wspólny refiment
+        # Wspólny refinement kaskadowy
         page_metadata = []
         batch_size = logits.size(1)
 
@@ -1243,11 +1124,12 @@ class CRNNInferencePipeline:
             if single_caps_img.dim() == 3:
                 single_caps_img = single_caps_img.unsqueeze(0)
 
-            # Wywołanie kaskady z logiką Veto wewnątrz
+            # Wywołanie kaskady z logiką Veto i zabezpieczonym mapowaniem kontekstu
             meta = self.predict_single_word_refinement(current_logits, single_caps_img, current_context)
             page_metadata.append(meta)
 
         return page_metadata
+
 
     def predict_page_batched(self, word_crops):
         if not word_crops: return []
@@ -1305,6 +1187,7 @@ class CRNNInferencePipeline:
 
         return final_metas
 
+
     def caps_predict_helper(self, img_np, threshold=0.75):
         """ Przewidywanie jednego lub wielu znaków przez CapsNet na wspólnym wycinku. """
         self.capsnet.eval()
@@ -1347,6 +1230,7 @@ class CRNNInferencePipeline:
                         })
 
             return detected
+
 
     def _perform_online_learning(self, page_data, al_manager):
         """ Trwała adaptacja wag i pamięć słownikowa autora. Uczy się na błędach i utrwala wiedzę na dysku po osiągnięciu progu. """
@@ -1426,6 +1310,7 @@ class CRNNInferencePipeline:
         if learned_count > 0:
             print(f"Skumulowano {learned_count} nowych poprawek. Łącznie do zapisu: {self.unsaved_learning_steps}/{SAVE_THRESHOLD}")
 
+
     def export_and_quantize_to_onnx(self):
         """ Konwertuje spersonalizowany model PyTorch do szybkiego formatu ONNX INT8. """
         print(f"[{time.strftime('%H:%M:%S')}] Rozpoczynam optymalizację (Kwantyzacja do INT8).")
@@ -1481,6 +1366,7 @@ class CRNNInferencePipeline:
             # Przywracamy model z powrotem na docelowe urządzenie
             self.model.to(self.device)
 
+
     @staticmethod
     def calculate_session_metrics(session_data):
         """ Analizuje całą sesję, oblicza CER, WER i zysk pewności. """
@@ -1514,6 +1400,7 @@ class CRNNInferencePipeline:
 
         return cer, wer, avg_gain
 
+
     def _prepare_single_tensor(self, crop):
         """ Pomocnicza metoda standaryzacji obrazu słowa do 64px wysokości. """
         h, w = crop.shape[:2]
@@ -1522,38 +1409,55 @@ class CRNNInferencePipeline:
         t = torch.from_numpy(resized).float().unsqueeze(0).unsqueeze(0).to(self.device)
         return (t / 255.0 - 0.5) / 0.5
 
+
     def predict_automatic(self, package, prefix_context=""):
-        """ Tryb wsadowy. Pomijamy segmentację na słowa, aby zachować kontekst wizualny wiersza. """
-        # Zmienne lokalne
+        """ Tryb wsadowy: Segmentacja wiersza na pojedyncze słowa przed inferencją. """
         current_img = package['processed_page']
         current_crops = []
         current_metas = []
 
+        # Kontekst przechodzi przez wszystkie słowa na stronie (semantyczna ciągłość)
         current_full_context = prefix_context
-        line_coords = package.get('lines_coords', [])
 
-        for i, line_img in enumerate(package['lines_img_data']):
+        for line_img in package['lines_img_data']:
             if line_img is None or line_img.size == 0: continue
+            
+            # Segmentacja linii na słowa
+            word_crops_info = self.segmentor.extract_atomic_crops(line_img)
+            
+            for word_img, (bx, by, bw, bh) in word_crops_info:
+                # Inferencja wizualna (CRNN + CapsNet)
+                img_t = self._prepare_single_tensor(word_img)
 
-            # Używamy lokalnej zmiennej current_img
-            l_box = line_coords[i] if i < len(line_coords) else (0, i * 100, current_img.shape[1], line_img.shape[0])
+                # Wywołujemy kaskadę wizyjną (zwraca słownik z wynikami)
+                meta = self.predict_single_word_refinement(img_t[0], img_t)
+                
+                # Używamy surowego wyniku wizji, aby Transformer mógł go poprawić w kontekście poprzednich słów
+                raw_word_text = meta.get('capsnet_result', '').strip()
+                
+                if self.transformer and raw_word_text:
+                    # Transformer poprawia wynik w oparciu o poprzednie słowo (kontekst)
+                    final_text = self.transformer.refine(raw_word_text, prefix_context=current_full_context)
+                    
+                    # Zapisujemy finalny wynik
+                    meta['final_result'] = final_text
+                    
+                    # Aktualizujemy kontekst (bierzemy końcówkę ostatniego poprawionego słowa)
+                    current_full_context = final_text[-50:] 
+                else:
+                    # Fallback, jeśli brak transformera
+                    meta['final_result'] = raw_word_text
+                    current_full_context = raw_word_text[-50:]
 
-            img_t = self._prepare_single_tensor(line_img)
-            meta = self.predict_single_word_refinement(img_t[0], img_t)
-            raw_line_text = meta.get('capsnet_result', '')
-
-            if self.transformer and str(raw_line_text).strip():
-                refined_line = self.transformer.refine(raw_line_text, prefix_context=current_full_context)
-                meta['final_result'] = refined_line
-                current_full_context = refined_line[-300:]
-            else:
-                meta['final_result'] = raw_line_text
-
-            meta.update({'box': l_box})
-
-            # Zapisujemy do lokalnych list
-            current_crops.append((line_img, l_box))
-            current_metas.append(meta)
+                # Aktualizacja metadanych dla UI
+                meta.update({
+                    'box': (bx, by, bw, bh),
+                    'crnn_result': meta.get('crnn_result', ''),
+                    'capsnet_result': raw_word_text
+                })
+                
+                current_crops.append((word_img, (bx, by, bw, bh)))
+                current_metas.append(meta)
 
         return {
             'path': package['path'],
@@ -1734,7 +1638,7 @@ class CRNNInferencePipeline:
         confs = confs.cpu().numpy()
 
         tagged_chars = [] # Tekst z <unc>... </unc>
-        plain_chars = [] # Czysty tekst
+        plain_chars = []  # Czysty tekst z zachowanymi spacjami
         res_confs = []
 
         words_data = []
@@ -1742,10 +1646,10 @@ class CRNNInferencePipeline:
         current_word_confs = []
         current_word_dubious = False
 
-        prev = 0 # Indeks poprzedniej ramki
+        prev = 0 # Indeks 0 to na sztywno [blank]
 
         for t, p in enumerate(preds):
-            # Wykryto nowy znak (nie blank i inny niż poprzedni)
+            # Wykryto nową aktywację znaku (nie blank i inny niż poprzednia klatka)
             if p != 0 and p != prev:
                 char = self.idx_to_char.get(p, '?')
                 is_uncertain = bool(timestep_mask[t]) if timestep_mask is not None else False
@@ -1753,11 +1657,11 @@ class CRNNInferencePipeline:
                 plain_chars.append(char)
                 res_confs.append(confs[t])
 
-                # Budowa wersji otagowanej dla Transformera
+                # Budowa wersji otagowanej dla bezpiecznej korekty Transformera
                 tagged_val = f"<unc>{char}</unc>" if is_uncertain else char
                 tagged_chars.append(tagged_val)
 
-                # Logika słownikowa (do CapsNetu)
+                # Spacja domyka zbierane słowo, ale zostaje w tekście głównym
                 if char == ' ':
                     if current_word:
                         words_data.append({
@@ -1767,28 +1671,30 @@ class CRNNInferencePipeline:
                         })
                         current_word, current_word_confs, current_word_dubious = "", [], False
                 else:
+                    # Dodajemy literę do aktualnie budowanego wyrazu
                     current_word += char
                     current_word_confs.append(confs[t])
-                    if is_uncertain: current_word_dubious = True
+                    if is_uncertain: 
+                        current_word_dubious = True
 
-            # Kontynuacja tego samego znaku (łączenie klatek w CTC)
+            # Kontynuacja tego samego znaku (stabilizacja i scalanie klatek w osi czasu CTC)
             elif p != 0 and p == prev and len(plain_chars) > 0:
                 is_uncertain = bool(timestep_mask[t]) if timestep_mask is not None else False
 
-                # Jeśli choć jedna klatka znaku jest niepewna, cały znak w tagged_chars musi mieć tag
+                # Jeśli choć jedna klatka składowa znaku jest niepewna, cały znak otrzymuje tag
                 if is_uncertain:
                     char = plain_chars[-1]
                     tagged_chars[-1] = f"<unc>{char}</unc>"
                     current_word_dubious = True
 
-                # Aktualizujemy pewność
+                # Aktualizujemy pewność znaku (bierzemy najgorszą/najniższą pewność z klatek składowych)
                 res_confs[-1] = min(res_confs[-1], confs[t])
-                if current_word:
+                if current_word and plain_chars[-1] != ' ':
                     current_word_confs[-1] = min(current_word_confs[-1], confs[t])
 
             prev = p
 
-        # Zamknięcie ostatniego słowa
+        # Zamknięcie ostatniego wyrazu w linii (jeśli linia nie kończyła się spacją)
         if current_word:
             words_data.append({
                 'word': current_word,
@@ -1855,3 +1761,53 @@ if __name__ == "__main__":
         print(f"[{now()}] BŁĄD INTEGRACJI: {e}")
 
     print("Aplikacja gotowa do obsługi żądań przez Backend.py.")
+
+"""
+cd /home/marek/OCR/HandwrittenTextRecognition
+
+# Czyszczenie starych kontenerów i podniesienie infrastruktury bazowej (API, Baza)
+docker system prune -f
+sudo docker compose down && sudo docker compose up -d --build
+
+# CRNN
+docker run -it --rm --name trening_crnn \
+    --gpus all \
+    --ipc=host \
+    --network=host \
+    -e PYTHONUNBUFFERED=1 \
+    -e PYTHONPATH=/app \
+    -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+    -v /home/marek/OCR/HandwrittenTextRecognition/Data:/app/Data:rw \
+    -v /home/marek/OCR/HandwrittenTextRecognition/output_data:/app/output_data \
+    -v /home/marek/OCR/HandwrittenTextRecognition/Models:/app/Models \
+    hcr-resnet-crnn:latest \
+    bash -c "python3 -m pip install --no-cache-dir langdetect shapiq && python3 -B Models/ResNetCRNNWordRecognition.py"
+
+# CapsNet
+docker run -it --rm --name trening_capsnet \
+    --gpus all \
+    --ipc=host \
+    --network=host \
+    -e PYTHONUNBUFFERED=1 \
+    -e PYTHONPATH=/app \
+    -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+    -v /home/marek/OCR/HandwrittenTextRecognition/Data:/app/Data:rw \
+    -v /home/marek/OCR/HandwrittenTextRecognition/output_data:/app/output_data \
+    -v /home/marek/OCR/HandwrittenTextRecognition/Models:/app/Models \
+    hcr-resnet-crnn:latest \
+    bash -c "python3 -m pip install --no-cache-dir langdetect shapiq && python3 -B Models/DeepCapsNetCharRecognition.py"
+
+# Transformer
+docker run -it --rm --name trening_transformer \
+    --gpus all \
+    --ipc=host \
+    --network=host \
+    -e PYTHONUNBUFFERED=1 \
+    -e PYTHONPATH=/app \
+    -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+    -v /home/marek/OCR/HandwrittenTextRecognition/Data:/app/Data:rw \
+    -v /home/marek/OCR/HandwrittenTextRecognition/output_data:/app/output_data \
+    -v /home/marek/OCR/HandwrittenTextRecognition/Models:/app/Models \
+    hcr-resnet-crnn:latest \
+    bash -c "python3 -m pip install --no-cache-dir langdetect shapiq transformers && python3 -B Models/TransformerDictionaryRefinement.py"
+"""
