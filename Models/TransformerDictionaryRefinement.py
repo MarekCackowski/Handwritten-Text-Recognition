@@ -36,6 +36,7 @@ from App.CRNNCNTROCR import (
 from Models.DeepCapsNetCharRecognition import CapsNet
 from Preprocessing.OpticalLayoutRecognition import PageToLineSegmentor, LineToWordSegmentor
 from Preprocessing.Preprocessing import Preprocessing
+
 BASE_DIR = "/app/data"
 VISUAL_DEBUG_DIR = MATRIX_DIR / "visual_debug_output"
 VISUAL_DEBUG_DIR.mkdir(parents=True, exist_ok=True)
@@ -636,7 +637,7 @@ class FinalInferenceEngine:
         elif caps_conf < 0.6:
             alpha -= 0.2
 
-        # Zabezpieczenie zakresu alfy (
+        # Zabezpieczenie zakresu alfy (chroni graf obliczeniowy i utrzymuje przepływ gradientu)
         alpha = max(min(alpha, 0.9), 0.2)
 
         # Finalna fuzja
@@ -752,7 +753,13 @@ class CascadeRefinementNetwork:
 
             # Normalizacja i zmiana rozmiaru pod CapsNet
             if crop.dim() == 3: crop = crop.unsqueeze(0)
-            crop_norm = (func.interpolate(crop, size=(64, 64), mode='bilinear', align_corners=False) - 0.5) / 0.5
+            crop_resized = func.interpolate(crop, size=(64, 64), mode='bilinear', align_corners=False)
+            
+            # Odwracamy polaryzację z CRNN (czarny atrament na białym) dla CapsNetu
+            crop_inverted = 1.0 - crop_resized
+            
+            # Aplikujemy oficjalną normalizację eMNIST
+            crop_norm = (crop_inverted - 0.1307) / 0.3081
             batch_tensors.append(crop_norm)
 
             # Pobranie kontekstu rekurencyjnego
@@ -931,7 +938,7 @@ class HybridVisualErrorGenerator:
 
 
     def apply_errors(self, text, rate=0.15, use_markers=False):
-        """ Generuje błędy z uwzględnieniem dryfu OCR i fizycznych zniekształceń. """
+        """ Generuje błędy z uwzględnieniem dryfu OCR, zniekształceń fizycznych i błędów segmentacji. """
         res = []
         i = 0
         while i < len(text):
@@ -939,9 +946,13 @@ class HybridVisualErrorGenerator:
             two_chars = text[i:i + 2]
             rand = random.random()
 
-            # Symulacja dryfu (OCR drift) - sąsiedni znak wpływa na obecny
+            # Jeśli to spacja, istnieje szansa, że Seam Carving jej nie zauważył (sklejenie słów)
+            if char == " " and rand < (rate * 1.5): 
+                i += 1
+                continue
+
+            # Symulacja dryfu - sąsiedni znak wpływa na obecny
             if 0 < i < len(text) - 1 and random.random() < 0.02:
-                # Znak zlewa się z sąsiadem
                 neighbor = text[i+1] if random.random() > 0.5 else text[i-1]
                 char = random.choice([char, neighbor, char + neighbor])
                 if len(char) > 1:
@@ -980,11 +991,15 @@ class HybridVisualErrorGenerator:
                 else:
                     res.append(new_c)
             else:
-                # Prawidłowy znak, ale z małą szansą na fałszywy alarm (False Positive)
+                # Prawidłowy znak
                 if use_markers and random.random() < 0.03:
                     res.append(f"{UNC_START}{char}{UNC_END}")
                 else:
                     res.append(char)
+
+            # Sztuczne cięcie wewnątrz słowa (wstawienie fałszywej spacji po znaku) - nadsegmentacja
+            if char != " " and random.random() < (rate * 0.5):
+                res.append(" ")
 
             i += 1
         return "".join(res)
@@ -1075,7 +1090,7 @@ class CurriculumCallback(TrainerCallback):
 
         self.dataset.rate = rate
         self.dataset.markers = markers
-        print(f"\n[Curriculum] Epoka {ep + 1}: Szum {rate * 100:.1f}%, Markery: {markers}")
+        print(f"[Curriculum] Epoka {ep + 1}: Szum {rate * 100:.1f}%, Markery: {markers}")
 
 
 def get_contextual_data_cached(pipeline, layout_engine, forms_dict, char_list, cache_path="context_cache.json"):
@@ -1320,10 +1335,14 @@ class StochasticPruningCallback(TrainerCallback):
 
         if model is None:
             return
+        
+        if state.best_metric is not None and state.best_metric > 0.4:
+            print("[LTH Pruning] CER za wysoki - pomijam przycinanie wag.")
+            return
 
         # Pomijamy pruning w ostatniej epoce
         if state.epoch < args.num_train_epochs:
-            print(f"\n[LTH Pruning] Stochastyczna kompresja wag po epoce {int(state.epoch)}.")
+            print(f"[LTH Pruning] Stochastyczna kompresja wag po epoce {int(state.epoch)}.")
 
             # Używamy magnitude_jitter, co jest najbezpieczniejsze dla Transformerów
             apply_stochastic_lth_step(
@@ -1383,15 +1402,6 @@ def run_full_training():
     real_pairs_pl = []
     real_pairs_en = []
 
-    num_en = len(real_pairs_en)
-    num_pl = len(real_pairs_pl)
-
-    # Jeśli polskich jest mniej, powielamy je
-    if num_pl < num_en:
-        multiplier = num_en // num_pl
-        real_pairs_pl = real_pairs_pl * multiplier
-        print(f"[{now()}] Wykonano oversampling danych PL (x{multiplier}).")
-
     ckpt = torch.load(CRNN_CHECKPOINT, map_location=DEVICE)
     chars = ckpt.get("char_list", [])
 
@@ -1437,6 +1447,14 @@ def run_full_training():
         torch.cuda.empty_cache()
 
     # Łączenie zbiorów <pl> i <en>
+    num_en = len(real_pairs_en)
+    num_pl = len(real_pairs_pl)
+
+    if num_pl > 0 and num_pl < num_en:
+        multiplier = num_en // num_pl
+        real_pairs_pl = real_pairs_pl * multiplier
+        print(f"[{now()}] Wykonano oversampling danych PL (x{multiplier}).")
+
     real_context_pairs = []
     for p in real_pairs_pl:
         real_context_pairs.append({
@@ -1501,19 +1519,12 @@ def run_full_training():
         num_train_epochs=6,
         per_device_train_batch_size=1,  # Mały vRAM, ale nadrabiamy akumulacją
         gradient_accumulation_steps=32,  # Efektywny batch size = 32
-        learning_rate=1e-2,  # Wyższy LR dla SGD
+        learning_rate=1e-3,  # Zmieniono z 1e-2: Adafactor, jako optymalizator adaptacyjny, wymaga niższego LR na start w porównaniu do SGD
         weight_decay=0.01,
         predict_with_generate=True,
-        fp16=True, # dla lepszej stabilności Transformera
-        # Wybrano SGD, aby wymusić lepszą generalizację reguł języka polskiego. 
-        # W przeciwieństwie do Adama, SGD rzadziej 'wykuwa słownik na blachę' (overfitting), 
-        # co jest kluczowe, gdy model ma poprawiać nieznane wcześniej rękopisy. 
-        # Jest również matematycznie najlżejszy dla zasobów VRAM.
-        optim="sgd",
-        # Optymalizacja dynamiki uczenia przez Momentum i Nesterova.
-        # momentum=0.9: Nadaje 'pęd' aktualizacji wag, co pozwala uniknąć lokalnych dołków błędu.
-        # nesterov=True: Algorytm 'patrzy w przód', co przyspiesza zbieżność i stabilizuje naukę.
-        optim_args="momentum=0.9,nesterov=True",
+        fp16=True,
+        optim="adafactor", # Zastąpiono SGD. Adafactor to dedykowany optymalizator dla architektury T5. Oferuje adaptacyjną stopę uczenia dla poszczególnych warstw (co drastycznie poprawia zbieżność i generalizację Transformerów w stosunku do SGD).
+        # Usunięto 'optim_args', ponieważ klasyczne Momentum i Nesterov nie są kompatybilne z adaptacyjną mechaniką Adafactor.
         eval_strategy="epoch",
         save_strategy="epoch",
         logging_steps=20,
@@ -1573,7 +1584,7 @@ def run_inference_test():
     tests = [
         {
             "lang": "pl",
-            "ctx": "Zgubiłem wczoraj klucze do mieszkania.",
+            "ctx": "Zgubiłem wczoraj klucze do mieszkania",
             "noisy": "Musz<unc>e</unc> t<unc>e</unc>raz wymi<unc>c</unc>nić zamek w drzw1ach."
         },
         {
@@ -1584,7 +1595,7 @@ def run_inference_test():
     ]
 
     for t in tests:
-        print(f"\nTest dla języka {t['lang'].upper()}")
+        print(f"Test dla języka {t['lang'].upper()}")
 
         # Wywołanie funkcji głównej
         poprawka = refine_ocr_text(t['noisy'], t['ctx'], model, tokenizer, DEVICE, t['lang'])
