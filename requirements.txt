@@ -1,4 +1,5 @@
 # BAZY I CHMURA
+celery==5.3.6          # Asynchroniczna kolejka zadań
 redis==5.0.1           # Klient bazy in-memory i brokera wiadomości
 pymongo>=4.6.0         # Sterownik do MongoDB (musi być, żeby App/Worker.py mógł pisać do bazy)
 motor                  # Asynchroniczny klient MongoDB
@@ -11,7 +12,7 @@ torchvision>=0.17.0    # Ścisła synchronizacja z torch 2.2.0 (uniknięcie bł�
 torchaudio             # Niezbędne jako zależność dla niektórych tokenizerów i modeli multimodalnych
 tensorboard            # Wizualizacja krzywych uczenia i wag kapsułek w czasie rzeczywistym
 onnx                   # Kwantyzacja
-onnxruntime            # Silnik inferencyjny ONNX. Drastycznie przyspiesza predykcję na produkcji
+onnxruntime-gpu        # Silnik inferencyjny ONNX. Drastycznie przyspiesza predykcję na produkcji
 peft                   # Multi-tenancy (LoRA / Adaptery użytkowników)
 accelerate>=0.28.0     # Obsługa DeepSpeed i FSDP; niezbędne do treningu na ograniczonym VRAM
 
@@ -36,11 +37,13 @@ scipy                  # Wymagane przez Transformers do operacji na macierzach r
 # ANALIZA WYNIKÓW, EKSPERYMENTY I RAPORTY
 fpdf2>=2.7.8           # Raporty PDF
 pandas                 # Zarządzanie tabelami wyników i generowanie raportów do pracy dyplomowej
-matplotlib             # Generowanie wykresów zbieżności i map istotności (Integrated Gradients)
+matplotlib>=3.7.0      # Generowanie wykresów zbieżności i map istotności (Integrated Gradients)
 scikit-learn           # Narzędzia do klasteryzacji błędów i PCA wektorów kapsułek
 tqdm                   # Paski postępu; integracja z tqdm.write dla logów treningowych
 seaborn                # Estetyczne wizualizacje macierzy pomyłek (Confusion Matrix)
 colorama               # Kolorowanie logów w terminalu (czytelność błędów walidacji)
+mlflow                 # Śledzenie eksperymentów, metryk i logowanie do lokalnego serwera
+pyspark                # Rozproszone przetwarzanie danych (zastępstwo dla Databricks)
 
 # METRYKI (CER/WER) I SYSTEM
 jiwer                  # Standardowa implementacja Word Error Rate i Character Error Rate
@@ -50,6 +53,7 @@ levenshtein            # Alternatywny wrapper dla algorytmów podobieństwa teks
 nltk                   # Tokenizacja i korpusy językowe do walidacji wyników semantycznych
 psutil                 # Monitorowanie zasobów systemowych
 passlib[bcrypt]        # Obsługa logowania
+langdetect>=1.0.9      # Wykrywanie języka (linie CVL są też po niemiecku)
 
 # BACKEND I KOLEJKOWANIE ZADAŃ
 fastapi                # Framework API
@@ -59,3 +63,12 @@ uvicorn[standard]      # Serwer z optymalizacjami C++ (szybsza pętla zdarzeń)
 celery>=5.3.6          # Stabilna wersja wspierająca Python 3.10 i wyższe (Worker)
 requests>=2.31.0       # Komunikacja z API
 prometheus-fastapi-instrumentator # Automatyczna ekspozycja metryk FastAPI
+
+# DODATKI SYSTEMOWE I DEKODOWANIE CTC
+torchmetrics           # Zoptymalizowane pod GPU metryki ML (w tym CER/WER)
+openpyxl               # Wsparcie dla zapisu raportów Pandas do formatu Excel (.xlsx)
+dnspython              # Niezbędne dla wsparcia DNS / SRV w połączeniach MongoDB
+pyyaml                 # Obsługa plików konfiguracyjnych YAML
+typing-extensions      # Wsparcie dla nowoczesnych adnotacji typów w PyTorch
+pyctcdecode            # Zaawansowany dekoder CTC integrujący model akustyczny (CRNN) z KenLM
+https://github.com/kpu/kenlm/archive/master.zip # Zaawansowany model językowy n-gram (KenLM)
