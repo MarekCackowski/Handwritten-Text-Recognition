@@ -1,0 +1,15 @@
+# Ukryte środowiska
+.venv
+.venv-1
+.git
+.vscode
+__pycache__
+
+# Foldery z danymi
+Data/
+dataset_ct/
+output_data/
+raw_ct_pngs/
+
+# Zignorowanie logów
+training.log
