@@ -37,7 +37,7 @@ The final module aggregates metrics like CER and WER, visualizes XAI attention m
 The project is configured to run directly on a local machine in an environment with a CUDA-enabled GPU.
 
 **Access to the Service and Metrics:**
-The public IP address of the virtual machine `vm-app` for communicating with the deployed system and the MLflow experiment tracking interface running on default port 5000 is: `172.189.176.192`
+The public IP address of the virtual machine `vm-app` for communicating with the deployed system and the MLflow experiment tracking interface running on default port 5000.
 
 ### Training the Modules
 
