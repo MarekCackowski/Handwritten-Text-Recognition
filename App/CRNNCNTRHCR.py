@@ -4,6 +4,7 @@ import json
 import gc
 import re
 import difflib
+import getpass
 from typing import Optional, cast, Any
 import Levenshtein
 import numpy as np
@@ -15,33 +16,44 @@ from collections import Counter
 from torch import nn
 from captum.attr import IntegratedGradients
 from Models.TransformerDictionaryRefinement import TransformerRefiner
-from Refinement.UserAdaptation import FeedbackAugmentor
+from Refinement.HybridBayesianActiveLearning import JointFeedbackFineTuner, FeedbackAugmentor
 import onnxruntime as ort
-from Refinement.UserAdaptation import JointFeedbackFineTuner
 from Preprocessing.Preprocessing import Preprocessing as ImagePreprocessor
 import multiprocessing
 multiprocessing.freeze_support()
 from fpdf import FPDF
 from Models.DeepCapsNetCharRecognition import CapsNet
 from dotenv import load_dotenv
-from tkinter import Tk, filedialog, messagebox
+from Analisis.TextMetrics import calculate_cer
 from pathlib import Path
 import matplotlib.pyplot as plt
 from skimage.filters import threshold_sauvola
 import onnx
 from onnxruntime.quantization import quantize_dynamic, QuantType
+try:
+    from tkinter import Tk, filedialog, messagebox
+except ImportError:
+    Tk = None
+    filedialog = None
+    messagebox = None
 
 now = lambda: time.strftime('%H:%M:%S')
+
+load_dotenv()
+
+HWR_CHECKPOINT_DIR = os.getenv("HWR_CHECKPOINT_DIR", "output_data/checkpoints/hwr")
+HCR_CHECKPOINT_DIR = os.getenv("HCR_CHECKPOINT_DIR", "output_data/checkpoints/hcr")
+TRANSFORMER_PATH = os.getenv("TRANSFORMER_CHECKPOINT_DIR", "output_data/checkpoints/transformer/byt5_htr_refiner_final")
+
+CRNN_WEIGHTS = os.path.join(HWR_CHECKPOINT_DIR, "WordLevelResNetCRNN.pth")
+CAPS_WEIGHTS = os.path.join(HCR_CHECKPOINT_DIR, "CharLevelCapsNet.pth")
+SAMPLE_IMAGE = "test_page.png"
 
 LC_TOKEN = "~"
 LOW_CONFIDENCE_CHAR_LIMIT = 0.6
 CHUNKS_SIZE = 8
 SAVE_THRESHOLD = 10
-DEVICE = torch.device('cuda')
-CRNN_WEIGHTS = "output_data/checkpoints/hwr/WordLevelResNetCRNN.pth"
-CAPS_WEIGHTS = "output_data/checkpoints/hcr/CharLevelCapsNet.pth"
-TRANSFORMER_PATH = "./byt5_htr_refiner_final"
-SAMPLE_IMAGE = "test_page.png"
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 # Plik będzie ukryty w folderze domowym użytkownika
 USER_HOME = Path.home()
@@ -84,8 +96,9 @@ def get_base_directory():
     root.withdraw()
     root.attributes("-topmost", True)
 
-    print(f"Witaj, {os.getlogin()}! Wybierz folder dla swoich projektów HTR.")
-    selected_path = filedialog.askdirectory(title=f"Wybierz folder roboczy dla: {os.getlogin()}")
+    current_user = getpass.getuser()
+    print(f"Witaj, {current_user}! Wybierz folder dla swoich projektów HTR.")
+    selected_path = filedialog.askdirectory(title=f"Wybierz folder roboczy dla: {current_user}")
 
     if selected_path:
         base_dir = Path(selected_path)
@@ -127,7 +140,7 @@ folders = [
 for folder in folders:
     folder.mkdir(parents=True, exist_ok=True)
 
-print(f"[{time.strftime('%H:%M:%S')}] Zalogowano: {os.getlogin()}")
+print(f"[{time.strftime('%H:%M:%S')}] Zalogowano: {getpass.getuser()}")
 print(f"[{time.strftime('%H:%M:%S')}] Folder roboczy: {BASE_DIR}")
 
 
@@ -217,36 +230,50 @@ class GeometryCorrector:
 class DubiousRegionSelector:
     """ Daje drugie spojrzenie CapsNet przed ewentualnym zastosowaniem słownika do poprawy. """
     def __init__(self, char_list, matrix_dir):
-        self.idx_to_char = {i + 1: c for i, c in enumerate(char_list)}
+        # Przekazujemy tylko znaki, które nie są [blank], aby uniknąć błędów w mapowaniu
+        clean_chars = [c for c in char_list if c != '[blank]']
+        self.idx_to_char = {i + 1: c for i, c in enumerate(clean_chars)}
         self.danger_zones = {}
 
+        # Wyznaczamy strefy ryzyka na podstawie macierzy pomyłek, jeśli istnieje
         if matrix_dir is not None:
             self.matrix_path = os.path.join(matrix_dir, "confusion_matrix.npy")
             if os.path.exists(self.matrix_path):
                 matrix = np.load(self.matrix_path)
-                for i in range(min(matrix.shape[0], len(self.idx_to_char))):
-                    row = matrix[i]
+                has_blank_row = matrix.shape[0] == len(self.idx_to_char) + 1
+                for char_idx in self.idx_to_char:
+                    matrix_idx = char_idx if has_blank_row else char_idx - 1
+                    if matrix_idx < 0 or matrix_idx >= matrix.shape[0]:
+                        continue
+                    row = matrix[matrix_idx]
                     total = row.sum()
-                    self.danger_zones[i] = (total - row[i]) / (total + 1e-6)
+                    self.danger_zones[char_idx] = (
+                        total - row[matrix_idx]
+                    ) / (total + 1e-6)
         else:
             self.matrix_path = None
 
     @staticmethod
     def estimate_uncertainty_mc(model, image_tensor, steps=64):
-        """ Oblicza niepewność bayesowską (Predictive Variance) przez wielokrotne przejścia w trybie aktywnego Dropoutu. """
+        """ Oblicza niepewność bayesowską przez wielokrotne przejścia w trybie aktywnego Dropoutu. """
         model.eval()
+
         # Wymuszamy działanie warstw Dropout nawet w trybie eval
         for m in model.modules():
             if isinstance(m, (torch.nn.Dropout, torch.nn.Dropout2d)):
                 m.train()
 
+        # Zapisujemy prawdopodobieństwa predykcji poprzedników, do porównania wariancji
+        device_type = image_tensor.device.type
         outputs = []
         with torch.no_grad():
             for _ in range(steps):
-                with torch.amp.autocast('cuda'):
-                    log_probs, *_ = model(image_tensor)
+                with torch.amp.autocast(device_type=device_type, enabled=(device_type == 'cuda')):
+                    out = model(image_tensor)
+                    logits = out[0] if isinstance(out, tuple) else out
+
                     # Zamiana log_probs na prawdopodobieństwa
-                    probs = torch.exp(log_probs)
+                    probs = torch.softmax(logits, dim=-1)
                     outputs.append(probs)
 
         # Przywracamy model do pełnego trybu eval
@@ -257,6 +284,8 @@ class DubiousRegionSelector:
         
         # Średnie prawdopodobieństwo (lepsza opinia niż z pojedynczego przejścia)
         mean_probs = torch.mean(all_probs, dim=0)
+        if mean_probs.dim() == 3 and mean_probs.size(1) == 1:
+            mean_probs = mean_probs.squeeze(1)
 
         # Obliczamy wariancję między przejściami
         variance_map = torch.var(all_probs, dim=0)
@@ -275,9 +304,15 @@ class DubiousRegionSelector:
 
         simple_punctuation = {".", ",", "'", '"'}
 
-        img_np = (image_tensor.cpu().numpy().squeeze() * 255).astype(np.uint8)
-        width, steps = image_tensor.shape[2], crnn_probs.shape[0]
-        stride = width / steps
+        raw_img = image_tensor.detach().cpu().numpy().squeeze()
+        if raw_img.min() < -1.05:
+            img_01 = np.clip((raw_img * 0.2259) + 0.8491, 0.0, 1.0)
+        else:
+            img_01 = np.clip((raw_img * 0.5) + 0.5, 0.0, 1.0)
+        img_np = (img_01 * 255).astype(np.uint8)
+
+        width, steps = image_tensor.shape[-1], crnn_probs.shape[0]
+        stride = width / max(steps, 1)
         candidates = []
 
         margin_threshold = 0.60 if intensive else 0.50
@@ -293,7 +328,8 @@ class DubiousRegionSelector:
             """ Przy trybie nocnym wykonujemy więcej przejść, aby uzyskać stabilniejszą estymację niepewności, kosztem czasu.
                 Przy normalnym trybie wystarczy mniej przejść, aby szybko zidentyfikować najbardziej niepewne znaki. """
             steps_count = 64 if intensive else 16
-            uncertainty_map, _, mc_mean_probs = self.estimate_uncertainty_mc(model_ref, image_tensor, steps=steps_count)
+            img_4d = image_tensor.unsqueeze(0) if image_tensor.dim() == 3 else image_tensor
+            uncertainty_map, _, mc_mean_probs = self.estimate_uncertainty_mc(model_ref, img_4d, steps=steps_count)
 
         if uncertainty_map is not None:
             adaptive_threshold = uncertainty_map.mean() + 1.5 * uncertainty_map.std()
@@ -321,7 +357,7 @@ class DubiousRegionSelector:
             # Wymuszamy sprawdzenie przez CapsNet, jeśli znak historycznie mylił się w więcej niż 10% przypadków
             is_historically_dangerous = char_danger_rate > 0.1
 
-            #  Statystyka (często mylone) lub niski margines (blisko siebie) lub niepewność modelu
+            # Często mylone lub blisko siebie w pewnościach poprzedników lub niepewność modelu
             if is_historically_dangerous or margin < margin_threshold or is_uncertain_mc:
                 center_x = (t + 0.5) * stride
 
@@ -329,21 +365,26 @@ class DubiousRegionSelector:
                 ink_map = 255 - img_np
                 vpp = np.sum(ink_map, axis=0)
                 search_win = int(stride * 1.5)
-                
+
+                # Wyznaczamy region do przeszukania w poziomie, aby znaleźć najbliższą przerwę w linii
                 start_x = max(0, int(center_x - search_win))
                 end_x = min(width, int(center_x + search_win))
                 search_region = vpp[start_x:end_x]
-                
+
+                # Jeśli nie ma przerw, wybieramy środek regionu lub najciemniejsze miejsce
                 empty_spaces = np.where(search_region <= 15)[0]
                 if len(empty_spaces) > 0:
                     closest_gap = start_x + empty_spaces[len(empty_spaces) // 2]
                 else:
                     closest_gap = start_x + np.argmin(search_region) if len(search_region) > 0 else int(center_x)
 
+                # Ustalamy okno wokół znalezionej przerwy, aby przekazać do CapsNet
                 window_size = 24
                 x1 = int(max(0, closest_gap - window_size))
                 x2 = int(min(width, closest_gap + window_size))
 
+                """ Dodajemy do listy kandydatów do dalszej analizy, z pełną informacją o niepewności, wyznaczonym punkcie przerwy
+                    między znakami i informacją, czy znak został wymuszony do analizy na podstawie historycznego ryzyka. """
                 candidates.append({
                     'timestep': t,
                     'x1': x1,
@@ -467,11 +508,8 @@ class VisualExplainer:
 
 
 class UncertaintyGatingAgent:
-    """
-    Agent Gatingowy (Uncertainty Gating Agent).
-    Monitoruje niepewność (entropię) i podejmuje autonomiczną decyzję
-    o routowaniu próbek do podsieci CapsNet oraz zarządzaniu TTA (Test-Time Augmentation).
-    """
+    """ Agent Gatingowy, który monitoruje niepewność i podejmuje decyzję o routowaniu próbek do
+        podsieci CapsNet oraz zarządzaniu TTA. """
     def __init__(self, capsnet_model, encoder, entropy_threshold=0.59, device='cuda'):
         self.capsnet = capsnet_model
         self.encoder = encoder
@@ -1082,6 +1120,7 @@ class PageToLineSegmentor:
 
             # Skalowanie wartości w osi Y (powrót do oryginalnej wysokości)
             s_full = (s_full_flat / scale_factor).astype(int)
+            seams_full.append(np.clip(s_full, 0, h - 1))
 
         # Dolna krawędź
         seams_full.append(np.full(w, h - 1, dtype=int))
@@ -1147,13 +1186,18 @@ class PageToLineSegmentor:
     def _extract_by_seams(img, top_seam, bottom_seam):
         """ Mapuje pofalowaną linię na prostokąt. """
         h_orig, w_orig = img.shape
-        target_h = int(np.mean(bottom_seam - top_seam))
+
+        # Wyznaczanie docelowej wysokości na podstawie średniej różnicy między górnym a dolnym seamem
+        target_h = max(1, int(np.mean(bottom_seam - top_seam)))
         line_img = np.full((target_h, w_orig), 255, dtype=np.uint8)
 
         for x in range(w_orig):
-            # Próbkowanie pionowe wzdłuż krzywizny seamu
+            # Próbkowanie pionowe wzdłuż krzywizny seamu, tak aby zachować proporcje i uniknąć zniekształceń
             raw_linspace = np.linspace(top_seam[x], bottom_seam[x], target_h)
-            source_y = np.asarray(raw_linspace).astype(np.float32)
+            y_indices = np.clip(np.round(raw_linspace).astype(int), 0, h_orig - 1)
+
+            # Kopiowanie pikseli z oryginalnego obrazu do nowego prostokątnego obrazu, żeby zachować integralność linii
+            line_img[:, x] = img[y_indices, x]
         return line_img
 
 
@@ -1276,6 +1320,48 @@ class CRNNInferencePipeline:
         entropy = -torch.sum(probs * torch.log(probs + 1e-9), dim=-1)
 
         return entropy.mean().item()
+
+
+    def predict_single_word_refinement(self, logits_or_img, single_caps_img, context_map=None):
+        """ Łączy dekodowanie CTC z korekcją kaskadową CapsNet i zwraca komplet metadanych dla Workera/UI. """
+        if logits_or_img.dim() == 3:
+            img_batch = logits_or_img.unsqueeze(0).to(self.device)
+            with torch.inference_mode():
+                raw_logits, ctx = self.model(img_batch, return_context=True)
+            crnn_logits = raw_logits[:, 0, :].clone()
+            context_map = ctx[0] if ctx is not None else None
+        else:
+            crnn_logits = logits_or_img.clone()
+
+        _, crnn_plain, crnn_confs, _ = self._decode_ctc_with_mask(crnn_logits)
+        audit_trail = []
+
+        if self.refiner is not None:
+            refined_logits, _, audit_trail = self.refiner.refine_logits(
+                crnn_logits,
+                single_caps_img,
+                crnn_text=crnn_plain,
+                context_map=context_map,
+                return_heatmap=True
+            )
+        else:
+            refined_logits = crnn_logits
+
+        probs = func.softmax(refined_logits, dim=-1)
+        max_p, _ = torch.max(probs, dim=-1)
+        timestep_mask = (max_p < LOW_CONFIDENCE_CHAR_LIMIT).cpu().numpy()
+
+        _, caps_plain, caps_confs, _ = self._decode_ctc_with_mask(refined_logits, timestep_mask=timestep_mask)
+        hybrid_conf = float(np.mean(caps_confs)) if caps_confs else (float(np.mean(crnn_confs)) if crnn_confs else 0.0)
+
+        return {
+            "crnn_result": crnn_plain,
+            "capsnet_result": caps_plain,
+            "final_result": caps_plain,
+            "hybrid_confidence": hybrid_conf,
+            "uncertainty_mask": [int(m) for m in timestep_mask],
+            "audit_trail": audit_trail
+        }
     
 
     def predict_batch(self, tensors_crnn, tensors_caps):
@@ -1434,82 +1520,98 @@ class CRNNInferencePipeline:
 
 
     def _perform_online_learning(self, page_data, al_manager):
-        """ Trwała adaptacja wag i pamięć słownikowa autora. Uczy się na błędach i utrwala wiedzę na dysku po osiągnięciu progu. """
+        """ Trwała adaptacja wag i pamięć słownikowa autora przy użyciu Hybrid Bayesian Active Learning. """
         if getattr(self, 'tuner', None) is None:
-            from Refinement.UserAdaptation import JointFeedbackFineTuner
+            from Refinement.HybridBayesianActiveLearning import JointFeedbackFineTuner, FeedbackAugmentor
             self.tuner = JointFeedbackFineTuner(
                 crnn_model=self.model,
                 caps_model=self.refiner.capsnet if self.refiner else None,
                 transformer_model=self.transformer if hasattr(self, 'transformer') else None,
                 encoder=self,
-                device=self.device
+                device=self.device,
+                tokenizer=getattr(self, 'tokenizer', None),
+                language="pl"
             )
+            self.augmentor = FeedbackAugmentor()
+        else:
+            if not hasattr(self, 'augmentor'):
+                from Refinement.HybridBayesianActiveLearning import FeedbackAugmentor
+                self.augmentor = FeedbackAugmentor()
 
-        augmentor = FeedbackAugmentor()
         learned_count = 0
 
         # Inicjalizacja licznika wewnątrz instancji
         if not hasattr(self, 'unsaved_learning_steps'):
             self.unsaved_learning_steps = 0
 
+        # Pobieramy próg z zapisanego atrybutu lub domyślnie 50
+        save_threshold = getattr(self, 'SAVE_THRESHOLD', 50)
+
         for crop_data, meta in zip(page_data['crops'], page_data['metadatas']):
-            # Pobieramy wynik wizji i ostateczną korektę (od usera lub ByT5)
-            noisy_vision = meta.get('capsnet_result')
+            # Pobieramy wynik wizji, ostateczną korektę oraz kontekst poprzedniej linii
+            noisy_vision = meta.get('capsnet_result') or meta.get('crnn_result', '')
             final_correction = meta.get('final_result')
+            prev_context = meta.get('prev_context', '')
 
             # Sprawdzamy, czy nastąpiła korekta manualna/semantyczna
             if noisy_vision != final_correction:
 
-                # Utrwalamy w bazie słownikowej
+                # Utrwalamy w bazie słownikowej / pamięci sesyjnej transformera
                 if self.transformer and hasattr(self.transformer, 'session_memory'):
                     self.transformer.session_memory.update(noisy_vision, final_correction)
 
-                # Adaptacja wag
+                # Przygotowanie wsadu i generowanie augmentacji przez FeedbackAugmentor
                 img_t = self._prepare_batch([crop_data[0]])
-                augmented_batch = augmentor.generate_variations(img_t, num_variations=4)
+                augmented_batch = self.augmentor.generate_variations(img_t, num_variations=4)
 
-                # Wynik wstępny to poprawka CapsNet
-                original_text = meta['caps_result']
+                # Dostrajanie kaskady (CRNN + CapsNet + ByT5)
+                try:
+                    self.tuner.fine_tune_on_feedback(
+                        images_batch=augmented_batch,
+                        original_pred_text=noisy_vision,
+                        corrected_text=final_correction,
+                        segmentor=self.segmentor,
+                        prev_context=prev_context
+                    )
+                    learned_count += 1
+                    self.unsaved_learning_steps += 1
+                except Exception as e:
+                    print(f"[{time.strftime('%H:%M:%S')}] Błąd podczas dostrajania wag w locie: {e}")
 
-                # Przekazujemy go do tunera wraz z poprawką użytkownika
-                self.tuner.fine_tune_on_feedback(
-                    images_batch=augmented_batch,
-                    original_pred_text=original_text,
-                    corrected_text=final_correction,
-                    segmentor=self.segmentor
-                )
-
-                learned_count += 1
-                self.unsaved_learning_steps += 1
-
-        # Logika trwałego zapisu
-        if self.unsaved_learning_steps >= SAVE_THRESHOLD:
-            print(f"\n[{time.strftime('%H:%M:%S')}] Osiągnięto próg adaptacji ({SAVE_THRESHOLD}). Trwa utrwalanie wag na dysku.")
+        # Logika trwałego zapisu po osiągnięciu progu kroków
+        if self.unsaved_learning_steps >= save_threshold:
+            print(f"\n[{time.strftime('%H:%M:%S')}] Osiągnięto próg adaptacji ({save_threshold}). Trwa utrwalanie wag przez ActiveLearningManager.")
             try:
-                # Tworzymy rotacyjny backup plików .pth przed nadpisaniem
-                for path in [CRNN_WEIGHTS, CAPS_WEIGHTS]:
-                    if os.path.exists(path):
-                        backup_path = path + ".bak"
-                        if os.path.exists(backup_path): os.remove(backup_path)
-                        os.rename(path, backup_path)
+                # Zapewnienie finalizacji resztek gradientów w buforze akumulacji
+                if hasattr(self.tuner, 'finalize_session_learning'):
+                    self.tuner.finalize_session_learning()
 
-                # Zapisujemy nowe, spersonalizowane wagi
-                if self.unsaved_learning_steps >= SAVE_THRESHOLD:
-                    print(f"[{time.strftime('%H:%M:%S')}] AL_MANAGE: Próg osiągnięty. Synchronizacja.")
+                print(f"[{time.strftime('%H:%M:%S')}] AL_MANAGE: Próg osiągnięty. Synchronizacja.")
 
-                    # Zapisujemy klasyczne wagi PyTorch (do kolejnych douczeń w przyszłości)
-                    self.tuner.save_fine_tuned_weights(al_manager)
+                # Zapis spersonalizowanej kaskady (.pth, wersjonowanie, ONNX INT8 i aktualizacja 'latest')
+                success = self.tuner.save_fine_tuned_weights(al_manager)
+                
+                if success:
                     self.unsaved_learning_steps = 0
-                    print("SYSTEM ZAKOŃCZYŁ NAUKĘ: Wagi .pth zostały trwale zaktualizowane.")
+                    print("SYSTEM ZAKOŃCZYŁ NAUKĘ: Wagi kaskady i modele Edge AI ONNX zostały pomyślnie zaktualizowane.")
+                else:
+                    print(f"[{time.strftime('%H:%M:%S')}] Ostrzeżenie: ActiveLearningManager zgłosił problem podczas zapisu kaskady.")
 
-                    # Zaraz po douczeniu, aplikacja generuje szybki model dla użytkownika
-                    self.export_and_quantize_to_onnx()
-
+            except PermissionError as pe:
+                print(f"[{time.strftime('%H:%M:%S')}] Błąd uprawnień przy zapisie lub rotacji backupu wag: {pe}")
+            except FileNotFoundError as fnf:
+                print(f"[{time.strftime('%H:%M:%S')}] Błąd ścieżki: Brak katalogu docelowego lub pliku podczas zapisu wag: {fnf}")
+            except OSError as ose:
+                print(f"[{time.strftime('%H:%M:%S')}] Błąd systemu plików (np. brak miejsca na dysku lub blokada pliku): {ose}")
+            except RuntimeError as rte:
+                print(f"[{time.strftime('%H:%M:%S')}] Błąd serializacji PyTorch lub eksportu grafu ONNX: {rte}")
+            except (ValueError, TypeError) as ve:
+                print(f"[{time.strftime('%H:%M:%S')}] Błąd parametrów modelu lub tensorów podczas kwantyzacji: {ve}")
             except Exception as e:
-                print(f"Krytyczny błąd zapisu wag: {e}")
+                print(f"[{time.strftime('%H:%M:%S')}] Nieoczekiwany, krytyczny błąd zapisu wag: {e}")
 
         if learned_count > 0:
-            print(f"Skumulowano {learned_count} nowych poprawek. Łącznie do zapisu: {self.unsaved_learning_steps}/{SAVE_THRESHOLD}")
+            print(f"Skumulowano {learned_count} nowych poprawek. Łącznie do zapisu: {self.unsaved_learning_steps}/{save_threshold}")
 
 
     def export_and_quantize_to_onnx(self):
@@ -1571,11 +1673,11 @@ class CRNNInferencePipeline:
     @staticmethod
     def calculate_session_metrics(session_data):
         """ Analizuje całą sesję, oblicza CER, WER i zysk pewności. """
-        total_dist = 0
-        total_chars = 0
         total_words = 0
         wrong_words = 0
         all_gains = []
+        references = []
+        hypotheses = []
 
         for page in session_data:
             for meta in page['metadatas']:
@@ -1583,9 +1685,8 @@ class CRNNInferencePipeline:
                 gt = meta.get('final_result', '')
 
                 if gt:
-                    # CER
-                    total_dist += Levenshtein.distance(pred, gt)
-                    total_chars += len(gt)
+                    references.append(gt)
+                    hypotheses.append(pred)
 
                     # WER
                     total_words += 1
@@ -1595,7 +1696,7 @@ class CRNNInferencePipeline:
                 # Zysk pewności
                 all_gains.append(meta.get('confidence_gain', 0))
 
-        cer = (total_dist / total_chars) * 100 if total_chars > 0 else 0
+        cer = calculate_cer(references, hypotheses)
         wer = (wrong_words / total_words) * 100 if total_words > 0 else 0
         avg_gain = np.mean(all_gains) * 100 if all_gains else 0
 
@@ -1948,13 +2049,9 @@ class CRNNInferencePipeline:
     def get_num_classes(self):
         return len(self.char_list) + 1
 
-
 if __name__ == "__main__":
-    # Diagnostyka sprzętowa
     print(f"[{now()}] Urządzenie: {DEVICE}")
-    print(f"[{now()}] Zalogowano użytkownika: {os.getlogin()}")
-
-    # Sprawdzenie dostępności zasobów
+    print(f"[{now()}] Zalogowano użytkownika: {getpass.getuser()}")
     print(f"[{now()}] Folder roboczy: {BASE_DIR}")
 
     weights_check = {
@@ -1967,70 +2064,48 @@ if __name__ == "__main__":
         status = "OK" if exists else "BRAK PLIKU"
         print(f"[{now()}] Status wag {model_name}: {status}")
 
-    # Test inicjalizacji Pipeline
-    try:
-        print(f"[{now()}] Pipeline zintegrowany poprawnie.")
-    except Exception as e:
-        print(f"[{now()}] BŁĄD INTEGRACJI: {e}")
-
     print("Aplikacja gotowa do obsługi żądań przez Backend.py.")
 
 """
-cd /home/marek/OCR/HandwrittenTextRecognition
+PROJECT_DIR="$HOME/HCR"
+cd "$PROJECT_DIR"
 
-# Czyszczenie starych kontenerów i podniesienie infrastruktury bazowej (API, Baza)
-docker system prune -f
-docker compose down && sudo docker compose up -d --build
+if [ -f "$PROJECT_DIR/.env" ]; then
+  set -a
+  source "$PROJECT_DIR/.env"
+  set +a
+fi
 
-# CRNN
-systemd-inhibit docker run -it --rm --name trening_crnn \
+HF_TOKEN_VAL="${HF_TOKEN:-${HUGGING_FACE_HUB_TOKEN:-}}"
+ENV_FLAG=""
+[ -f "$PROJECT_DIR/.env" ] && ENV_FLAG="--env-file $PROJECT_DIR/.env"
+
+docker rm -f trening_htr 2>/dev/null || true
+docker compose up -d
+
+gnome-terminal --title="Monitor GPU & Docker" -- bash -c "watch -n 1 'nvidia-smi; echo \"\"; docker ps --format \"table {{.Names}}\t{{.Status}}\"'; exec bash" &
+
+systemd-inhibit docker run -it --rm --name trening_htr \
      --gpus all \
      --ipc=host \
-     --network=host \
+     --network hcr_htr-network \
      --shm-size=16gb \
+     $ENV_FLAG \
      -e PYTHONUNBUFFERED=1 \
      -e PYTHONPATH=/app \
      -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-     -v /home/marek/.cache/torch:/root/.cache/torch \
-     -v /home/marek/OCR/HandwrittenTextRecognition/Data:/app/Data:rw \
-     -v /home/marek/OCR/HandwrittenTextRecognition/Data:/app/data:rw \
-     -v /home/marek/OCR/HandwrittenTextRecognition/output_data:/app/output_data \
-     -v /home/marek/OCR/HandwrittenTextRecognition/Models:/app/Models \
-     hcr-resnet-crnn:latest \
-     bash -c "python3 -m pip install --no-cache-dir langdetect shapiq gdown && python3 -m pip install --no-cache-dir --no-deps craft-text-detector && python3 -B Models/ResNetCRNNWordRecognition.py"
-
-# CapsNet
-systemd-inhibit docker run -it --rm --name trening_capsnet \
-     --gpus all \
-     --ipc=host \
-     --network=host \
-     --shm-size=16gb \
-     -e PYTHONUNBUFFERED=1 \
-     -e PYTHONPATH=/app \
-     -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-     -v /home/marek/.cache/torch:/root/.cache/torch \
-     -v /home/marek/OCR/HandwrittenTextRecognition/Data:/app/Data:rw \
-     -v /home/marek/OCR/HandwrittenTextRecognition/Data:/app/data:rw \
-     -v /home/marek/OCR/HandwrittenTextRecognition/output_data:/app/output_data \
-     -v /home/marek/OCR/HandwrittenTextRecognition/Models:/app/Models \
-     hcr-resnet-crnn:latest \
-     bash -c "python3 -m pip install --no-cache-dir langdetect shapiq gdown && python3 -m pip install --no-cache-dir --no-deps craft-text-detector && python3 -B Models/DeepCapsNetCharRecognition.py"
-
-# Transformer
-systemd-inhibit docker run -it --rm --name trening_transformer \
-    --gpus all \
-    --ipc=host \
-    --network=host \
-    --shm-size=16gb \
-    -e PYTHONUNBUFFERED=1 \
-    -e PYTHONPATH=/app \
-    -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-    -v /home/marek/.cache/torch:/root/.cache/torch \
-    -v /home/marek/.cache/huggingface:/root/.cache/huggingface \
-    -v /home/marek/OCR/HandwrittenTextRecognition/Data:/app/Data:rw \
-    -v /home/marek/OCR/HandwrittenTextRecognition/Data:/app/data:rw \
-    -v /home/marek/OCR/HandwrittenTextRecognition/output_data:/app/output_data \
-    -v /home/marek/OCR/HandwrittenTextRecognition/Models:/app/Models \
-    hcr-resnet-crnn:latest \
-    bash -c "python3 -m pip install --no-cache-dir langdetect shapiq transformers && python3 -B Models/TransformerDictionaryRefinement.py"
+     -e HF_TOKEN="$HF_TOKEN_VAL" \
+     -e HUGGING_FACE_HUB_TOKEN="$HF_TOKEN_VAL" \
+     -e HF_HUB_VERBOSITY=error \
+     -e HF_HUB_DISABLE_IMPLICIT_TOKEN=0 \
+     -e MONGO_URL="mongodb://htr_mongo:27017" \
+     -e REDIS_HOST="htr_redis" \
+     -e REDIS_URL="redis://htr_redis:6379/0" \
+     -e MINIO_URL="minio:9000" \
+     -v "$HOME/.cache/torch:/root/.cache/torch" \
+     -v "$HOME/.cache/huggingface:/root/.cache/huggingface" \
+     -v "$PROJECT_DIR:/app" \
+     -v "$PROJECT_DIR/Data:/app/data:rw" \
+     htr-worker:v6 \
+     python3 -B run_all.py
 """

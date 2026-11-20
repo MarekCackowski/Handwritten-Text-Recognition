@@ -1,5 +1,6 @@
 import os
-os.environ["MLFLOW_TRACKING_URI"] = "http://127.0.0.1:5000"
+os.environ["MLFLOW_ALLOW_FILE_STORE"] = "true"
+os.environ["MLFLOW_TRACKING_URI"] = "file:///app/output_data/mlruns"
 os.environ["MLFLOW_EXPERIMENT_NAME"] = "Transformer_Semantic_Refiner"
 
 import copy
@@ -26,7 +27,8 @@ from datasets import load_dataset
 from evaluate import load
 from spellchecker import SpellChecker
 from tqdm import tqdm
-from celery import Celery
+from functools import partial
+
 
 from transformers import (
     Seq2SeqTrainingArguments,
@@ -41,11 +43,13 @@ from peft import get_peft_model, LoraConfig, TaskType, PeftModel
 
 # Zależności wewnątrzprojektowe
 BASE_DIR = "/app/data"
-MATRIX_DIR = Path(BASE_DIR) / "HandwrittenTextRecognition" / "output_data" / "checkpoints" / "hcr"
+CHECKPOINT_BASE = "/app/output_data/checkpoints"
+MATRIX_DIR = Path(CHECKPOINT_BASE) / "hcr"
+
 try:
     from App.CRNNCNTRHCR import CRNNInferencePipeline, PersistentAuthorMemory
 except ImportError:
-    pass # Zabezpieczenie, jeśli te klasy zostały przeniesione gdzie indziej
+    pass  # Zabezpieczenie, jeśli te klasy zostały przeniesione gdzie indziej
 
 from Models.DeepCapsNetCharRecognition import CapsNet
 from Preprocessing.OpticalLayoutRecognition import PageToLineSegmentor, LineToWordSegmentor
@@ -54,33 +58,24 @@ from Preprocessing.Preprocessing import Preprocessing
 # Inicjalizacja głównych ścieżek
 VISUAL_DEBUG_DIR = MATRIX_DIR / "visual_debug_output"
 VISUAL_DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+
 IAM_ROOT = os.path.join(BASE_DIR, "iam_words")
 XML_DIR = os.path.join(IAM_ROOT, "xml")
 FORMS_DIR = os.path.join(IAM_ROOT, "forms")
 SENTENCES_TXT = os.path.join(IAM_ROOT, "sentences.txt")
-CHECKPOINT_BASE = os.path.join(BASE_DIR, "HandwrittenTextRecognition", "output_data", "checkpoints")
-CRNN_CHECKPOINT = os.path.join(CHECKPOINT_BASE, "hwr", "best_cer_model.pth")
-CAPS_CHECKPOINT = os.path.join(CHECKPOINT_BASE, "hcr", "CharLevelCapsNet.pth")
-BASE_DIR = "/app/data"
-VISUAL_DEBUG_DIR = MATRIX_DIR / "visual_debug_output"
-VISUAL_DEBUG_DIR.mkdir(parents=True, exist_ok=True)
-IAM_ROOT = os.path.join(BASE_DIR, "iam_words")
-XML_DIR = os.path.join(IAM_ROOT, "xml")
-FORMS_DIR = os.path.join(IAM_ROOT, "forms")
-SENTENCES_TXT = os.path.join(IAM_ROOT, "sentences.txt")
-CHECKPOINT_BASE = os.path.join(BASE_DIR, "HandwrittenTextRecognition", "output_data", "checkpoints")
+
 CRNN_CHECKPOINT = os.path.join(CHECKPOINT_BASE, "hwr", "best_cer_model.pth")
 CAPS_CHECKPOINT = os.path.join(CHECKPOINT_BASE, "hcr", "CharLevelCapsNet.pth")
 YOLO_WEIGHTS = "best_word_det.pt"
 TARGET_LANGUAGE = "en"
 
-CACHE_DIR = os.path.join(BASE_DIR, "HandwrittenTextRecognition", "output_data", "refiner_cache")
+CACHE_DIR = os.path.join(CHECKPOINT_BASE, "refiner_cache")
 CACHE_PAIRS = os.path.join(CACHE_DIR, "real_context_pairs.json")
 CACHE_MATRIX = os.path.join(CACHE_DIR, "confusion_matrix.npy")
 os.makedirs(CACHE_DIR, exist_ok=True)
 
 MODEL_NAME = "google/byt5-base"
-OUTPUT_DIR = "./byt5_htr_refiner_final"
+OUTPUT_DIR = os.path.join(CHECKPOINT_BASE, "transformer", "byt5_htr_refiner_final")
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 LC_TOKEN = "~"
@@ -89,7 +84,6 @@ UNC_END = "</unc>"
 SEED = 42
 
 REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
-CELERY_APP = Celery('htr_tasks', broker=f'redis://{REDIS_HOST}:6379/0')
 
 def now():
     return time.strftime('%H:%M:%S')
@@ -99,6 +93,77 @@ def seed_everything(seed):
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+
+
+try:
+    from run_all import epoch_progress_bar
+except ImportError:
+    def epoch_progress_bar(iterable, total_epochs: int, stage_name: str, initial: int = 0):
+        return tqdm(
+            iterable,
+            total=total_epochs,
+            initial=initial,
+            desc=f"{stage_name} | Epoki",
+            unit="ep",
+            bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]{postfix}",
+            dynamic_ncols=True,
+        )
+
+
+class EpochProgressCallback(TrainerCallback):
+    """Aktualizuje pasek postępu epok dla Seq2SeqTrainer z zachowaniem logów w konsoli."""
+    def __init__(self, stage_name: str = "ByT5 Refiner"):
+        self.stage_name = stage_name
+        self.bar = None
+        self.total_epochs = 1
+        self.last_logged_epoch = 0
+
+    def on_train_begin(self, args, state, control, **kwargs):
+        self.total_epochs = max(1, int(round(args.num_train_epochs)))
+        initial_ep = min(self.total_epochs, max(0, int(round(state.epoch or 0.0))))
+        self.last_logged_epoch = initial_ep
+        self.bar = epoch_progress_bar(
+            range(initial_ep, self.total_epochs),
+            total_epochs=self.total_epochs,
+            stage_name=self.stage_name,
+            initial=initial_ep,
+        )
+
+    def on_epoch_begin(self, args, state, control, **kwargs):
+        if self.bar is None:
+            return
+        current_ep = min(self.total_epochs, int(state.epoch or 0) + 1)
+        self.bar.set_description_str(f"{self.stage_name} | Epoka {current_ep}/{self.total_epochs}")
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if self.bar is None or not logs:
+            return
+        postfix = {}
+        if "loss" in logs:
+            postfix["loss"] = f"{logs['loss']:.4f}"
+        if "eval_cer" in logs:
+            postfix["cer"] = f"{logs['eval_cer']:.4f}"
+        elif "eval_loss" in logs:
+            postfix["val"] = f"{logs['eval_loss']:.4f}"
+        if postfix:
+            self.bar.set_postfix(**postfix)
+
+    def on_epoch_end(self, args, state, control, **kwargs):
+        if self.bar is None:
+            return
+        completed_ep = min(self.total_epochs, max(self.last_logged_epoch + 1, int(round(state.epoch or 0.0))))
+        steps_to_advance = max(0, completed_ep - self.last_logged_epoch)
+        if steps_to_advance > 0:
+            self.bar.update(steps_to_advance)
+            self.last_logged_epoch = completed_ep
+
+    def on_train_end(self, args, state, control, **kwargs):
+        if self.bar is not None:
+            remaining = self.total_epochs - self.last_logged_epoch
+            if remaining > 0:
+                self.bar.update(remaining)
+            self.bar.close()
+            self.bar = None
 
 
 def parse_iam_forms_to_lines(sentences_txt):
@@ -175,7 +240,9 @@ def generate_contextual_noise_data(pipeline, forms_dict, char_list):
             try:
                 # Wywołanie z obydwoma listami tensorów
                 res = pipeline.predict_batch(tensors_crnn, tensors_caps)
-                curr_noisy_line = " ".join([r['final_result'] for r in res])
+                curr_noisy_line = " ".join(
+                    str(r["final_result"]) for r in res if isinstance(r, dict) and "final_result" in r
+                )
 
                 # Szukamy GT dla tej linii w forms_dict
                 if l_idx < len(lines):
@@ -183,7 +250,7 @@ def generate_contextual_noise_data(pipeline, forms_dict, char_list):
 
                     matcher = difflib.SequenceMatcher(None, target_clean, curr_noisy_line)
                     for tag, i1, i2, j1, j2 in matcher.get_opcodes():
-                        if tag == 'replace':
+                        if tag == "replace":
                             t_chunk = target_clean[i1:i2]  # Co miało być
                             p_chunk = curr_noisy_line[j1:j2]  # Co wyszło z CRNN i poprawki CapsNet
 
@@ -199,8 +266,18 @@ def generate_contextual_noise_data(pipeline, forms_dict, char_list):
                         "target": target_clean
                     })
                     prev_line_clean = target_clean
-            except Exception as e:
-                print(f"Błąd podczas predykcji: {e}")
+
+            except RuntimeError as e:
+                print(f"[{now()}] Błąd inferencji modeli (PyTorch/CUDA) w linii {l_idx} ({f_id}): {e}")
+                continue
+            except (KeyError, IndexError) as e:
+                print(f"[{now()}] Błąd struktury wyników lub indeksowania w linii {l_idx} ({f_id}): {e}")
+                continue
+            except (ValueError, TypeError) as e:
+                print(f"[{now()}] Nieprawidłowy typ lub wartość danych w linii {l_idx} ({f_id}): {e}")
+                continue
+            except Exception as e:  # noqa: BLE001 - awaria pojedynczej linii nie przerywa przetwarzania formularza
+                print(f"[{now()}] Nieoczekiwany błąd predykcji w linii {l_idx} ({f_id}): {e}")
                 continue
 
     return real_contextual_pairs, matrix
@@ -217,19 +294,29 @@ class TransformerRefiner:
         # Ładowanie tokenizatora z tokenami '~', '<unc>'
         self.tokenizer = ByT5Tokenizer.from_pretrained(model_path)
 
+        # Bezpieczna precyzja dla ByT5 (float16 powoduje przepełnienie i NaN w generacji)
+        model_dtype = torch.bfloat16 if (torch.cuda.is_available() and torch.cuda.is_bf16_supported()) else torch.float32
+
         # Ładowanie wytrenowanego modelu
         if os.path.exists(os.path.join(model_path, "adapter_config.json")):
             print(f"[{time.strftime('%H:%M:%S')}] Ładowanie adaptera LoRA dla ByT5.")
-            # Ładujemy czystą bazę
+            # Ładujemy czystą bazę z wyłączonym wiązaniem wag embeddingów
             base_model = T5ForConditionalGeneration.from_pretrained(
-                "google/byt5-base", torch_dtype=torch.float16
-            ).to(self.device)
+                "google/byt5-base",
+                torch_dtype=model_dtype,
+                tie_word_embeddings=False,
+            )
+            # Synchronizacja rozmiaru embeddingów przed nałożeniem adaptera (uwzględnia dodane tagi <pl>, <en>, <unc>)
+            base_model.resize_token_embeddings(len(self.tokenizer))
+
             # Nakładamy mały adapter użytkownika
             self.model = PeftModel.from_pretrained(base_model, model_path).to(self.device)
         else:
             # Fallback do pełnego modelu
             self.model = T5ForConditionalGeneration.from_pretrained(
-                model_path, torch_dtype=torch.float16
+                model_path,
+                torch_dtype=model_dtype,
+                tie_word_embeddings=False,
             ).to(self.device)
         self.model.eval()
 
@@ -271,23 +358,24 @@ class TransformerRefiner:
         self.model.enable_adapter_layers()
         self.model.set_adapter(adapter_name)
 
-    def refine(self, noisy_text, prefix_context=""):
+    def refine(self, noisy_text, prefix_context="", context_text=None):
         """ Główna metoda korekty semantycznej z mechanizmem Cache. """
-        context_text = prefix_context if prefix_context is not None else ""
+        raw_ctx = context_text if context_text is not None else prefix_context
+        resolved_context = raw_ctx if raw_ctx is not None else ""
 
         if not noisy_text.strip():
             return noisy_text
 
-        cache_key = (noisy_text, context_text)
+        cache_key = (noisy_text, resolved_context)
         if cache_key in self._correction_cache:
             return self._correction_cache[cache_key]
 
-        # POPRAWKA: Wymuszenie dodania tagu językowego, jeśli go nie ma
+        # Wymuszenie dodania tagu językowego, jeśli go nie ma
         lang_tag = f"<{self.language}> "
-        if not context_text.startswith(lang_tag.strip()):
-            full_context = lang_tag + context_text if context_text else lang_tag.strip()
+        if not resolved_context.startswith(lang_tag.strip()):
+            full_context = lang_tag + resolved_context if resolved_context else lang_tag.strip()
         else:
-            full_context = context_text
+            full_context = resolved_context
 
         # Przygotowanie wejścia (teraz idealnie zgodne z treningiem)
         if self.language == 'pl':
@@ -359,24 +447,25 @@ class TransformerRefiner:
         return word_embeddings
 
     def score_text(self, text, context_text=""):
-            """ Oblicza prawdopodobieństwo tekstu w danym kontekście. """
-            lang_tag = f"<{self.language}> "
-            if not context_text.startswith(lang_tag.strip()):
-                full_context = lang_tag + context_text if context_text else lang_tag.strip()
-            else:
-                full_context = context_text
-    
-            if self.language == 'pl':
-                full_prompt = f"kontekst: {full_context} popraw ocr: {text}"
-            else:
-                full_prompt = f"context: {full_context} fix ocr: {text}"
-    
-            inputs = self.tokenizer(full_prompt, return_tensors="pt").to(self.device)
-            labels = self.tokenizer(text, return_tensors="pt").input_ids.to(self.device)
-    
-            with torch.inference_mode():
-                outputs = self.model(**inputs, labels=labels)
-                return -outputs.loss.item()
+        """ Oblicza prawdopodobieństwo tekstu w danym kontekście. """
+        safe_context = context_text or ""
+        lang_tag = f"<{self.language}> "
+        if not safe_context.startswith(lang_tag.strip()):
+            full_context = lang_tag + safe_context if safe_context else lang_tag.strip()
+        else:
+            full_context = safe_context
+
+        if self.language == 'pl':
+            full_prompt = f"kontekst: {full_context} popraw ocr: {text}"
+        else:
+            full_prompt = f"context: {full_context} fix ocr: {text}"
+
+        inputs = self.tokenizer(full_prompt, return_tensors="pt").to(self.device)
+        labels = self.tokenizer(text_target=text, return_tensors="pt").input_ids.to(self.device)
+
+        with torch.inference_mode():
+            outputs = self.model(**inputs, labels=labels)
+            return -outputs.loss.item()
 
     def predict_page_batched(self, lines_list):
         """ Przetwarza całą stronę (listę linii) sekwencyjnie. Poprzednia poprawiona linia staje się kontekstem dla następnej. """
@@ -404,135 +493,216 @@ class DubiousRegionSelector:
         self.char_list = char_list
         self.split_risky_chars = split_risky_chars
 
-        # Znaki, które CRNN często podaje zamiast polskich ogonków
-        self.polish_substitution_risky = {"a", "c", "e", "l", "n", "o", "s", "z", "x"}
-
-        # Interpunkcja ignorowana przez CapsNet
+        # Fallback używany wyłącznie wtedy, gdy plik macierzy pomyłek jeszcze nie istnieje
+        self.fallback_risky_chars = {"a", "c", "e", "l", "n", "o", "s", "z", "x"}
         self.punctuation_marks = {".", ",", "!", "?", ":", ";", "-", "'", '"', "(", ")"}
 
-        # Cache dla macierzy pomyłek
-        self._confusing_indices = None
+        # Cache dla macierzy pomyłek: (high_risk_fp_indices, confusing_fn_indices)
+        self._cached_risk_sets = None
         self._last_matrix_path = None
+        self._last_matrix_mtime = None
 
-    def _get_confusing_indices(self, path_str: str) -> set[int]:
-        """ Ładuje indeksy pomyłek z walidacją struktury i obsługą błędów wejścia/wyjścia. """
+    def _get_confusion_risk_sets(self, path_str: str) -> tuple[set[int], set[int]]:
+        """Wyznacza z macierzy pomyłek dwa zbiory indeksów (w przestrzeni char_list):
+        1. high_risk (błędy kolumnowe / FP): znaki, które CRNN często podstawia zamiast innych (np. 'a' za 'ą').
+        2. medium_risk (błędy wierszowe / FN): znaki, które CRNN najczęściej gubi lub myli.
+        """
         if not path_str:
-            return set()
+            return set(), set()
 
-        # Używamy pathlib dla czystszej manipulacji ścieżkami
         path = Path(path_str)
 
-        # Cache hit: jeśli ścieżka i dane są zgodne, nie dotykaj dysku
-        if path == self._last_matrix_path and self._confusing_indices is not None:
-            return self._confusing_indices
-
         try:
-            # Sprawdzenie istnienia i czy to na pewno plik
             if not path.is_file():
-                return set()
+                return set(), set()
 
-            # Próba załadowania danych
-            cm_data = np.load(path)
+            current_mtime = path.stat().st_mtime
+            if (
+                path == self._last_matrix_path
+                and current_mtime == self._last_matrix_mtime
+                and self._cached_risk_sets is not None
+            ):
+                return self._cached_risk_sets
 
-            # Walidacja: czy to macierz 2D? (CapsNet wymaga kwadratowej macierzy klas)
-            if not isinstance(cm_data, np.ndarray) or cm_data.ndim != 2:
+            cm_data = np.load(path, allow_pickle=False)
+
+            if hasattr(cm_data, "close"):
+                cm_data.close()
+                tqdm.write(f"[{now()}] Warning: Plik {path.name} jest archiwum .npz zamiast macierzy .npy.")
+                return set(), set()
+
+            if (
+                not isinstance(cm_data, np.ndarray)
+                or cm_data.ndim != 2
+                or cm_data.size == 0
+                or cm_data.shape[0] != cm_data.shape[1]
+            ):
                 tqdm.write(
-                    f"[{now()}] Warning: Macierz w {path.name} ma zły format (ndim={getattr(cm_data, 'ndim', 'N/A')}).")
-                return set()
+                    f"[{now()}] Warning: Macierz w {path.name} ma nieprawidłowy kształt "
+                    f"(shape={getattr(cm_data, 'shape', 'N/A')})."
+                )
+                return set(), set()
 
-            cm = cm_data.astype(np.float64)
+            cm = cm_data.astype(np.float64, copy=False)
 
-            # Obliczamy błędy (E): Suma wiersza (wszystkie próby) minus przekątna (poprawne)
-            # E_i = \sum_{j=1}^{N} CM_{i,j} - CM_{i,i}
-            error_scores = cm.sum(axis=1) - np.diag(cm)
+            # Jeśli macierz CRNN zawiera klasę [blank] na indeksie 0, odcinamy ją, aby wyrównać indeksy do char_list
+            if cm.shape[0] == len(self.char_list) + 1:
+                cm = cm[1:, 1:]
 
-            # Wybieramy top 15 najbardziej problematycznych indeksów
-            result = set(np.argsort(error_scores)[-15:].tolist())
+            diag = np.diag(cm)
+            # Błędy kolumnowe (FP): ile razy model przewidział dany znak błędnie zamiast innego
+            fp_scores = np.nan_to_num(cm.sum(axis=0) - diag, nan=0.0, posinf=0.0, neginf=0.0)
 
-            # Aktualizacja cache'u tylko przy sukcesie
-            self._confusing_indices = result
+            # Błędy wierszowe (FN): ile razy prawdziwy znak został pomylony z innym
+            fn_scores = np.nan_to_num(cm.sum(axis=1) - diag, nan=0.0, posinf=0.0, neginf=0.0)
+
+            # Wyznaczamy indeksy znaków, które są w najwyższym ryzyku błędów FP i FN
+            fp_nonzero = np.flatnonzero(fp_scores > 0)
+            high_risk = (
+                set(fp_nonzero[np.argsort(fp_scores[fp_nonzero])[-10:]].tolist())
+                if fp_nonzero.size > 0
+                else set()
+            )
+
+            # Poza tym, wyznaczamy indeksy znaków, które są w najwyższym ryzyku błędów FN (gubienie lub mylenie)
+            fn_nonzero = np.flatnonzero(fn_scores > 0)
+            medium_risk = (
+                # 15 najczęściej gubionych znaków, znowu liczba wyznaczona eksperymentalnie, bo nie było danych do optymalizacji
+                set(fn_nonzero[np.argsort(fn_scores[fn_nonzero])[-15:]].tolist())
+                if fn_nonzero.size > 0
+                else set()
+            )
+
+            # W ten sposób mamy kompletne zbiory ryzykownych znaków do dalszej analizy w selektorze regionów niepewnych
+            self._cached_risk_sets = (high_risk, medium_risk)
             self._last_matrix_path = path
+            self._last_matrix_mtime = current_mtime
 
-            return result
+            return self._cached_risk_sets
 
-        except (OSError, ValueError, TypeError) as e:
-            # OSError: brak dostępu, błędy dysku, ValueError: uszkodzony plik .npy (np. niepełny zapis), TypeError: błędy typów przy operacjach NumPy
+        # Obsługa błędów przy wczytywaniu macierzy pomyłek, po return, bo nie chcemy przerywać działania programu, tylko logować problem
+        except (OSError, ValueError, TypeError, EOFError) as e:
             tqdm.write(f"[{now()}] Błąd krytyczny macierzy pomyłek ({path.name}): {e}")
-            return set()
-
-    def select_dubious_groups(self, crnn_probs: torch.Tensor, width: int, confusion_matrix_path: str = "", intensive: bool = False) -> list[dict]:
-        """  Inteligentny selektor regionów niepewnych. Decyduje, co wysłać do CapsNetu, a co zostawić dla Transformera. """
+            return set(), set()
+        
+        
+    def select_dubious_groups(
+        self,
+        crnn_probs: torch.Tensor,
+        width: int,
+        confusion_matrix_path: str = "",
+        intensive: bool = False,
+        merge: bool = True,
+    ) -> list:
+        """ Wybiera grupy kroków czasowych, które są niepewne i wymagają weryfikacji przez CapsNet.
+            Zwraca listę słowników z informacjami o wycinkach (x1, x2) i prawdopodobieństwie. """
         steps = crnn_probs.shape[0]
-        if steps == 0: return []
+        if steps == 0:
+            return []
 
-        # Softmax, aby operować na prawdopodobieństwach (0.0 - 1.0)
-        probs = torch.softmax(crnn_probs, dim=-1)
-        top_p, top_idx = torch.topk(probs, 2, dim=-1)
+        # Sprawdzamy, czy tensor prawdopodobieństw jest już w formacie softmax, żeby nie robić ponownego obliczania softmaxu
+        is_already_probs = (
+            crnn_probs.min() >= 0.0
+            and crnn_probs.max() <= 1.0
+            and torch.allclose(
+                crnn_probs.sum(dim=-1),
+                torch.ones(steps, device=crnn_probs.device, dtype=crnn_probs.dtype),
+                atol=1e-2,
+            )
+        )
+
+        # Obliczamy prawdopodobieństwa i marginesy dla każdego kroku czasowego
+        probs = crnn_probs if is_already_probs else torch.softmax(crnn_probs, dim=-1)
+        top_p, top_idx = torch.topk(probs, min(2, probs.shape[-1]), dim=-1)
         top1_p, top1_idx = top_p[:, 0], top_idx[:, 0]
-        margin = top1_p - top_p[:, 1]
+        margin = (top1_p - top_p[:, 1]) if top_p.shape[-1] > 1 else top1_p
 
+        # Wyznaczamy okno czasowe dla CapsNetu, jako proporcję szerokości obrazu do liczby kroków czasowych, z dodatkowym marginesem
         stride = width / steps
-        # Szerokość okna zależy od trybu (intensive = głębsza analiza)
         window_factor = 3.5 if intensive else 2.8
         half_window = int((stride * window_factor) / 2)
 
+        # Pobieramy indeksy znaków, które są często mylone z innymi
+        high_risk_indices, medium_risk_indices = self._get_confusion_risk_sets(confusion_matrix_path)
+        risky_chars = (
+            {c.lower() for c in self.split_risky_chars}
+            if self.split_risky_chars
+            else self.fallback_risky_chars
+        )
+        has_blank_offset = probs.shape[-1] == len(self.char_list) + 1
+
+        # Tworzymy listę kandydatów do weryfikacji przez CapsNet
         candidates = []
-
-        # Progi decyzyjne
         base_threshold = 0.60 if intensive else 0.50
-        substitution_threshold = 0.75  # Dla par często mylonych (z macierzy pomyłek)
-        polish_risk_threshold = 0.85  # Wysoki próg dla 'a', 'c', 'e' itp.
-        margin_min = 0.18  # Jeśli różnica między Top1 a Top2 jest mała, wysyłaj do CapsNet
+        substitution_threshold = 0.75
+        polish_risk_threshold = 0.85
+        margin_min = 0.18
 
-        # Definicja znaków wspieranych przez CapsNet
-        capsnet_targets = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789" + "ąćęłńóśźżĄĆĘŁŃÓŚŹŻ")
+        capsnet_targets = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789ąćęłńóśźżĄĆĘŁŃÓŚŹŻ")
 
+        # Dla każdego kroku czasowego sprawdzamy, czy spełnia kryteria niepewności, i ewentualnie dodajemy go do listy kandydatów
         for t in range(steps):
             char_idx = int(top1_idx[t].item())
-            char_str = self.char_list[char_idx] if char_idx < len(self.char_list) else ""
+            
+            # Pomijamy pustą klatkę CTC [blank]
+            if has_blank_offset and char_idx == 0:
+                continue
 
-            # Jeśli to interpunkcja, nie obciążaj CapsNetu
+            list_idx = char_idx - 1 if has_blank_offset else char_idx
+            char_str = self.char_list[list_idx] if 0 <= list_idx < len(self.char_list) else ""
+
+            # Pomijamy znaki interpunkcyjne i znaki, które nie są obsługiwane przez CapsNet
             if char_str in self.punctuation_marks or char_str not in capsnet_targets:
                 continue
 
-            # Zwiększamy czujność dla polskich znaków
             current_limit = base_threshold
-            if char_str.lower() in self.polish_substitution_risky:
+            if char_str.lower() in risky_chars or list_idx in high_risk_indices:
                 current_limit = polish_risk_threshold
+            elif list_idx in medium_risk_indices:
+                current_limit = substitution_threshold
 
-            # Czy CRNN jest wystarczająco pewny
             if top1_p[t] < current_limit or margin[t] < margin_min:
                 center_x = int((t + 0.5) * stride)
                 candidates.append({
-                    't': t,
+                    'timestep': t,
                     'x1': max(0, center_x - half_window),
                     'x2': min(width, center_x + half_window),
                     'prob': top1_p[t].item(),
                     'char': char_str
                 })
 
-        if not candidates: return []
+        if not candidates:
+            return []
 
-        # Agregacja bliskich kroków czasowych w jedno "słowo/znak" dla CapsNetu
+        # Grupujemy sąsiadujące kroki czasowe w spójne wycinki dla CapsNetu
         final_groups = []
         current_group = [candidates[0]]
 
+        """ Wyznacza niepewne fragmenty predykcji CRNN i grupuje je w przedziały do weryfikacji przez CapsNet.
+            Metoda analizuje rozkład prawdopodobieństw w kolejnych krokach czasowych CTC:
+            1. Pomija puste klatki, znaki interpunkcyjne oraz znaki spoza docelowego alfabetu.
+            2. Kwalifikuje klatki jako niepewne, gdy pewność top-1 spada poniżej progu adaptacyjnego
+                (podwyższanego dla polskich znaków wysokiego ryzyka oraz klas z największą liczbą błędów
+                w macierzy pomyłek) lub gdy różnica między top-1 a top-2 jest mniejsza niż `0.18`, wyznaczone
+                na sztywno, bo nie ma możliwości użycia wartości dynamicznych, ze względu na zbyt mały rozmiar danych.
+            3. Scala sąsiednie niepewne klatki odległe o maksymalnie 3 kroki czasowe w pojedyncze grupy,
+                aby pojedyncza, szersza litera była analizowana przez CapsNet tylko raz. Zakładamy tutaj,
+                że jeśli kilka kroków czasowych jest niepewnych, to prawdopodobnie dotyczą tego samego znaku."""
         for i in range(1, len(candidates)):
-            # Jeśli kroki są blisko siebie (do 3 klatek), traktujemy to jako jeden obiekt/błąd
-            if candidates[i]['t'] - current_group[-1]['t'] <= 3:
+            if candidates[i]['timestep'] - current_group[-1]['timestep'] <= 3:
                 current_group.append(candidates[i])
             else:
-                final_groups.append(self._merge_group(current_group))
+                final_groups.append(self._merge_group(current_group) if merge else current_group)
                 current_group = [candidates[i]]
 
-        final_groups.append(self._merge_group(current_group))
+        final_groups.append(self._merge_group(current_group) if merge else current_group)
         return final_groups
 
     @staticmethod
     def _merge_group(group: list[dict]) -> dict:
         """ Łączy kilka kroków czasowych w jeden spójny wycinek dla CapsNetu. """
         return {
-            'timestep': group[len(group) // 2]['t'],
+            'timestep': group[len(group) // 2]['timestep'],
             'x1': min(c['x1'] for c in group),
             'x2': max(c['x2'] for c in group)
         }
@@ -615,7 +785,7 @@ class FinalInferenceEngine:
         """ Uruchamia pojedynczy przebieg CRNN i zwraca komplet danych. """
         with torch.no_grad():
             raw_logits, context_maps = self.vision.model(img_tensor.to(DEVICE), return_context=True)
-            crnn_text = self.vision.encoder.decode_greedy(raw_logits)[0]
+            crnn_text = self.vision.encoder.decode_greedy(raw_logits)[0][0]
             log_probs = raw_logits.log_softmax(2)
             conf = self._calculate_crnn_confidence(log_probs)
         return crnn_text, log_probs, context_maps, conf
@@ -663,163 +833,306 @@ class FinalInferenceEngine:
         avg_probs = torch.stack(predictions).mean(dim=0)
         avg_log_probs = torch.log(avg_probs + 1e-8)
         
-        crnn_text = self.vision.encoder.decode_greedy(avg_log_probs)[0]
+        crnn_text = self.vision.encoder.decode_greedy(avg_log_probs)[0][0]
         conf = self._calculate_crnn_confidence(avg_log_probs)
         
         return crnn_text, avg_log_probs, base_context, conf
 
+    def _decode_with_char_alignment(self, log_probs_2d: torch.Tensor, step_unc_mask: list[int]):
+        """ Dekoduje CTC greedy i rzutuje maskę niepewności klatek czasowych [T] na konkretne znaki słowa [L]. """
+        preds = torch.argmax(log_probs_2d, dim=-1).cpu().tolist()
+        idx_to_char = getattr(
+            self.vision.encoder, "num_to_char",
+            getattr(self.vision.encoder, "idx_to_char", {})
+        )
+
+        chars = []
+        char_unc_mask = []
+        prev_idx = 0
+
+        for t, idx in enumerate(preds):
+            if idx != 0 and idx != prev_idx:
+                ch = idx_to_char.get(idx, "")
+                if ch:
+                    chars.append(ch)
+                    is_unc = 1 if (t < len(step_unc_mask) and step_unc_mask[t] > 0) else 0
+                    char_unc_mask.append(is_unc)
+            elif idx == prev_idx and idx != 0 and char_unc_mask:
+                if t < len(step_unc_mask) and step_unc_mask[t] > 0:
+                    char_unc_mask[-1] = 1
+            prev_idx = idx
+
+        return "".join(chars), char_unc_mask
+
+    def _measure_ink_ratio(self, img_tensor):
+        """ Zwraca udział pikseli atramentu [0.0 - 1.0] niezależnie od skali tensora. """
+        arr = img_tensor.detach().cpu().float().numpy()
+        if arr.ndim == 4:
+            arr = arr[0]
+        if arr.ndim == 3:
+            arr = arr.mean(axis=0)
+
+        arr_min, arr_max = float(arr.min()), float(arr.max())
+        if arr_max - arr_min < 1e-6:
+            return 0.0
+
+        gray = ((arr - arr_min) / (arr_max - arr_min) * 255.0).astype(np.uint8)
+        _, binary = cv.threshold(gray, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU)
+
+        # Zakładamy, że tło dominuje na brzegach obrazu
+        border = np.concatenate([binary[0, :], binary[-1, :], binary[:, 0], binary[:, -1]])
+        bg_is_white = np.median(border) > 127
+        ink_mask = (binary == 0) if bg_is_white else (binary == 255)
+        return float(np.mean(ink_mask))
+
+
+    def _apply_ink_aware_morphology(self, img_tensor, ink_ratio):
+        """ Dobiera kierunek morfologii do gęstości atramentu: rozkleja nadmiar lub pogrubia braki. """
+        device = img_tensor.device
+        dtype = img_tensor.dtype
+        arr = img_tensor.detach().cpu().float().numpy()
+        squeeze_batch = False
+        if arr.ndim == 4:
+            arr = arr[0]
+            squeeze_batch = True
+
+        c, h, w = arr.shape
+        arr_min, arr_max = float(arr.min()), float(arr.max())
+        if arr_max - arr_min < 1e-6:
+            return img_tensor
+
+        gray = ((arr[0] - arr_min) / (arr_max - arr_min) * 255.0).astype(np.uint8)
+        border = np.concatenate([gray[0, :], gray[-1, :], gray[:, 0], gray[:, -1]])
+        bg_is_white = np.median(border) > 127
+
+        kernel = cv.getStructuringElement(cv.MORPH_ELLIPSE, (2, 2))
+
+        if ink_ratio > 0.34:
+            # Za dużo atramentu (rozlany tusz / sklejone znaki) -> ścieńczenie atramentu
+            processed = cv.dilate(gray, kernel, iterations=1) if bg_is_white else cv.erode(gray, kernel, iterations=1)
+        elif ink_ratio < 0.10:
+            # Za mało atramentu (wyblakły tusz) -> pogrubienie atramentu
+            processed = cv.erode(gray, kernel, iterations=1) if bg_is_white else cv.dilate(gray, kernel, iterations=1)
+        else:
+            # Normalna gęstość -> delikatne otwarcie usuwające drobny szum bez sklejania
+            processed = cv.morphologyEx(gray, cv.MORPH_CLOSE if bg_is_white else cv.MORPH_OPEN, kernel)
+
+        norm = processed.astype(np.float32) / 255.0 * (arr_max - arr_min) + arr_min
+        out = np.repeat(norm[None, :, :], c, axis=0)
+        if squeeze_batch:
+            out = out[None, :, :, :]
+        return torch.from_numpy(out).to(device=device, dtype=dtype)
+
+
+    def _compute_dynamic_thresholds(self, log_probs, ink_ratio):
+        """ Wyznacza adaptacyjny próg paniki oraz najniższą pewność pojedynczego znaku. """
+        base_panic = getattr(self, "base_panic_threshold", 0.50)
+        early_drop = getattr(self, "early_drop_threshold", 0.15)
+
+        probs = torch.softmax(log_probs.squeeze(1), dim=-1)  # [T, C]
+        max_probs, pred_ids = probs.max(dim=-1)
+
+        # Pomijamy klatki blank (indeks 0), aby ocenić pewność samych znaków
+        non_blank_mask = pred_ids != 0
+        if non_blank_mask.any():
+            char_probs = max_probs[non_blank_mask]
+            min_char_conf = float(char_probs.min().item())
+            est_len = int(non_blank_mask.sum().item())
+        else:
+            min_char_conf = 0.0
+            est_len = 0
+
+        # Dłuższe wyrazy mają nieco niższy próg średni, ale ekstremalny ink_ratio podnosi czujność
+        len_offset = -0.07 * min(est_len / 12.0, 1.0)
+        ink_offset = 0.06 if (ink_ratio > 0.36 or ink_ratio < 0.08) else 0.0
+
+        dynamic_panic = float(np.clip(base_panic + len_offset + ink_offset, 0.38, 0.65))
+        return dynamic_panic, early_drop, min_char_conf
+
+
+    def _apply_semantic_veto(self, caps_text, semantic_proposal, char_unc_mask, caps_conf, semantic_conf, hybrid_conf):
+        """ Rozstrzyga konflikt między CapsNet a ByT5 na podstawie budżetu niepewnych znaków, żeby uniknąć halucynacji. """
+        proposal = (semantic_proposal or "").strip()
+
+        # Pusta odpowiedź lub brak zmian ze strony Transformera, to akceptacja CapsNet
+        if not proposal:
+            return caps_text, True
+        if proposal == caps_text:
+            return caps_text, False
+
+        dist = Levenshtein.distance(caps_text, proposal)
+        len_diff = abs(len(caps_text) - len(proposal))
+        unc_count = sum(1 for m in char_unc_mask if m > 0)
+
+        # CapsNet jest pewny i nie zgłosił żadnych niepewnych znaków
+        if caps_conf > 0.95 and unc_count == 0:
+            return caps_text, True
+
+        # Ochrona przed halucynacją długości: jeśli różnica długości jest większa niż liczba niepewnych znaków + 1, odrzucamy propozycję
+        max_allowed_len_diff = max(2, unc_count + 1)
+        if len_diff > max_allowed_len_diff:
+            return caps_text, True
+
+        # ByT5 może zmienić tyle znaków, ile było w <unc> (+1 marginesu tylko przy słabej wizji)
+        extra_tolerance = 1 if caps_conf < 0.65 else 0
+        allowed_edits = max(1, unc_count) + extra_tolerance
+        if dist > allowed_edits and caps_conf >= 0.60:
+            return caps_text, True
+
+        # Wybieramy źródło o wyższej pewności, jeśli oba niewystarczająco pewne
+        if semantic_conf + 0.25 < caps_conf and caps_conf > 0.70:
+            return caps_text, True
+        if hybrid_conf < 0.35 and caps_conf >= semantic_conf:
+            return caps_text, True
+
+        return proposal, False
+
+
     def process_word(self, img_crnn, img_caps, prev_context=""):
         self.vision.model.eval()
-        PANIC_THRESHOLD = 0.50
-        EARLY_DROP_THRESHOLD = 0.15
 
-        # Na początek tandardowa predykcja CRNN
+        # Standardowa predykcja CRNN + analiza gęstości atramentu i progów adaptacyjnych
         crnn_text, log_probs, context_maps, crnn_conf = self._run_crnn_pass(img_crnn)
+        ink_ratio = self._measure_ink_ratio(img_crnn)
+        panic_threshold, early_drop_threshold, min_char_conf = self._compute_dynamic_thresholds(log_probs, ink_ratio)
 
-        # Jeżeli całe słowo zostało przez CRNN przekazane jako bardzo niepewne staramy się uratować sytuacje ingerując w głównych podejrzanych
-        if crnn_conf < PANIC_THRESHOLD:
-            
-            # Wyrównywanie kontrastu (CLAHE)
+        needs_rescue = (crnn_conf < panic_threshold) or (min_char_conf < 0.32 and len(crnn_text) > 1)
+
+        if needs_rescue:
             img_clahe = self._apply_clahe(img_crnn)
             c_text, c_log_probs, c_ctx, c_conf = self._run_crnn_pass(img_clahe)
-            
             if c_conf > crnn_conf:
                 crnn_text, log_probs, context_maps, crnn_conf = c_text, c_log_probs, c_ctx, c_conf
-                img_crnn = img_clahe  
-                
-            if crnn_conf < PANIC_THRESHOLD:
-                # Ratunkowa morfologia (pogrubienie)
-                img_morph = self._apply_morphology(img_crnn)
+                img_crnn = img_clahe
+                ink_ratio = self._measure_ink_ratio(img_crnn)
+
+            if crnn_conf < panic_threshold:
+                img_morph = self._apply_ink_aware_morphology(img_crnn, ink_ratio)
                 m_text, m_log_probs, m_ctx, m_conf = self._run_crnn_pass(img_morph)
-                
                 if m_conf > crnn_conf:
                     crnn_text, log_probs, context_maps, crnn_conf = m_text, m_log_probs, m_ctx, m_conf
                     img_crnn = img_morph
-                    
-                if crnn_conf < PANIC_THRESHOLD:
-                    # Ostateczne uśrednienie (TTA)
-                    t_text, t_log_probs, t_ctx, t_conf = self._run_tta_pass(img_crnn)
-                    
-                    if t_conf > crnn_conf:
-                        crnn_text, log_probs, context_maps, crnn_conf = t_text, t_log_probs, t_ctx, t_conf
 
-        # Odrzucamy słowo całkowicie, aby nie propagować śmieci wizualnych
-        if crnn_conf < EARLY_DROP_THRESHOLD:
+            if crnn_conf < (panic_threshold - 0.05):
+                t_text, t_log_probs, t_ctx, t_conf = self._run_tta_pass(img_crnn)
+                if t_conf > crnn_conf:
+                    crnn_text, log_probs, context_maps, crnn_conf = t_text, t_log_probs, t_ctx, t_conf
+
+        if crnn_conf < early_drop_threshold:
+            rejected_label = "[Nierozpoznano]"
             return {
                 "crnn_result": crnn_text,
                 "caps_result": "",
-                "final_result": "[Nierozpoznano]",
+                "final_result": rejected_label,
                 "is_semantic_rejected": True,
-                "uncertain_zones": [1] * log_probs.shape[1],
+                "uncertain_zones": [1] * len(rejected_label),
                 "caps_confidence": 0.0,
                 "hybrid_confidence": 0.0,
                 "dynamic_alpha": 0.0
             }
 
         # Poprawka CapsNet
-        probs_refined, unc_mask, caps_conf, debug_data = self.vision.refiner.refine_logits(
+        probs_refined, step_unc_mask, caps_conf, debug_data = self.vision.refiner.refine_logits(
             log_probs.squeeze(1),
             img_caps.to(DEVICE),
             context_map=context_maps[0]
         )
-        caps_text = self.get_decoded_text(probs_refined)[0]
 
-        if caps_conf < 0.7 or any(c in caps_text for c in "ąćęłńóśźż"):
+        caps_text, char_unc_mask = self._decode_with_char_alignment(probs_refined, step_unc_mask)
+        if not caps_text:
+            # Obejmujemy całą sekwencję jako niepewną, jeśli CapsNet nie zwrócił żadnego znaku
+            caps_text = self.vision.encoder.decode_greedy(probs_refined.unsqueeze(1))[0][0]
+            char_unc_mask = [0] * len(caps_text)
+
+        meta_list = debug_data.get('batch_metadata') or (
+            debug_data.get('metadata') if isinstance(debug_data.get('metadata'), list) else []
+        )
+
+        if (caps_conf < 0.7 or any(c in caps_text for c in "ąćęłńóśźż")) and meta_list:
             try:
-                # Inicjalizacja wyjaśniacza dla sieci kapsułowej
                 explainer = VisualExplainer(self.vision.refiner.caps_net)
 
-                # debug_data zawiera listę wycinków i ich pozycji
-                for i, meta in enumerate(debug_data['metadata']):
+                for i, meta in enumerate(meta_list):
                     t = meta['timestep']
+                    char = meta.get('char', '')
 
-                    # Jeśli ten krok czasowy jest oznaczony jako niepewny
-                    if unc_mask[t] > 0:
-                        char = caps_text[t] if t < len(caps_text) else "?"
-                        target_idx = self.vision.encoder.char_to_idx.get(char, 0)
+                    if char and t < len(step_unc_mask) and step_unc_mask[t] > 0:
+                        char_to_idx = getattr(
+                            self.vision.encoder, "char_to_num",
+                            getattr(self.vision.encoder, "char_to_idx", {})
+                        )
+                        target_idx = char_to_idx.get(char, 0)
 
-                        # Pobieramy konkretny wycinek i wektor kontekstu
                         crop_tensor = debug_data['tensors'][i]
-                        context_vec = debug_data['contexts'][i]
+                        if crop_tensor.dim() == 3:
+                            crop_tensor = crop_tensor.unsqueeze(0)
+                        crop_tensor = crop_tensor.to(DEVICE)
 
-                        # Generujemy mapę istotności pikseli
+                        context_vec = debug_data['contexts'][i]
+                        if context_vec.dim() == 1:
+                            context_vec = context_vec.unsqueeze(0)
+                        context_vec = context_vec.to(DEVICE)
+
                         attr_map = explainer.explain(crop_tensor, context_vec, target_idx)
 
-                        # Zapis do folderu
-                        debug_path = os.path.join(VISUAL_DEBUG_DIR, f"xai_{char}_{int(time.time())}.png")
+                        safe_char = char if char.isalnum() else f"ord{ord(char)}"
+                        debug_path = os.path.join(VISUAL_DEBUG_DIR, f"xai_{safe_char}_{int(time.time())}_{i}.png")
                         explainer.plot_explanation(crop_tensor, attr_map, char, debug_path)
+            except RuntimeError as e:
+                print(f"Błąd obliczeń tensorowych lub pamięci CUDA w XAI: {e}")
+            except (KeyError, IndexError) as e:
+                print(f"Błąd indeksowania lub brakujący klucz metadanych w XAI: {e}")
+            except (ValueError, TypeError) as e:
+                print(f"Błąd wartości lub nieprawidłowy typ danych w XAI: {e}")
+            except OSError as e:
+                print(f"Błąd zapisu wykresu XAI na dysku: {e}")
+            except Exception as e:  # noqa: BLE001
+                print(f"Nieoczekiwany błąd modułu XAI (pomijam wizualizację): {e}")
 
-            except Exception as e:
-                print(f"Błąd XAI: {e}")
-
-        # Przygotowanie wejścia dla Transformera
+        # Przygotowanie wejścia dla Transformera (na wyrównanej masce znaków)
         tagged_input = ""
-        for char, m in zip(caps_text, unc_mask):
+        for char, m in zip(caps_text, char_unc_mask):
             if m > 0:
                 tagged_input += f"<unc>{char}</unc>"
             else:
                 tagged_input += char
 
         # Korekta Semantyczna ByT5
-        semantic_proposal = self.semantic.refine(tagged_input, context_text=prev_context)
+        semantic_proposal = self.semantic.refine(tagged_input, prefix_context=prev_context)
         semantic_score = self.semantic.score_text(semantic_proposal, context_text=prev_context)
         semantic_conf = min(max(1.0 + (semantic_score / 20.0), 0.1), 1.0)
 
         # Dynamiczne wagowanie
         alpha = 0.6
-
-        # Po długości słowa (dłuższe słowa = silniejszy kontekst językowy)
         if len(caps_text) > 7:
             alpha -= 0.15
         elif len(caps_text) <= 3:
             alpha += 0.15
 
-        # Relatywna pewność (jeśli CapsNet jest bardzo pewny, podbijamy jego wagę)
         if caps_conf > 0.92:
             alpha += 0.1
         elif caps_conf < 0.6:
             alpha -= 0.2
 
-        # Zabezpieczenie zakresu alfy (chroni graf obliczeniowy i utrzymuje przepływ gradientu)
         alpha = max(min(alpha, 0.9), 0.2)
 
-        # Finalna fuzja
+        # Finalna fuzja i spójne Veto
         hybrid_conf = (alpha * caps_conf) + ((1.0 - alpha) * semantic_conf)
-
-        # Veto
-        dist = Levenshtein.distance(caps_text, semantic_proposal)
-        change_ratio = dist / max(len(caps_text), 1)
-        len_ratio = abs(len(caps_text) - len(semantic_proposal)) / max(len(caps_text), 1)
-
-        is_rejected = False
-        final_text = semantic_proposal
-
-        # Blokada na Transformera (zbyt chętny do dodawania znaków)
-        if change_ratio > 0.4 and caps_conf > 0.80:
-            final_text = caps_text
-            is_rejected = True
-
-        # Ekstremalne zaufanie do wizji (np. nazwiska, których nie ma w słowniku)
-        elif caps_conf > 0.96 and semantic_conf < 0.5:
-            final_text = caps_text
-            is_rejected = True
-
-        # Zabezpieczenie przed halucynacjami (drastyczna zmiana długości)
-        elif len_ratio > 0.3 and caps_conf > 0.7:
-            final_text = caps_text
-            is_rejected = True
-
-        # Całościowy brak zaufania do wyniku hybrydowego
-        elif hybrid_conf < 0.35:
-            final_text = caps_text
-            is_rejected = True
+        final_text, is_rejected = self._apply_semantic_veto(
+            caps_text=caps_text,
+            semantic_proposal=semantic_proposal,
+            char_unc_mask=char_unc_mask,
+            caps_conf=caps_conf,
+            semantic_conf=semantic_conf,
+            hybrid_conf=hybrid_conf
+        )
 
         return {
             "crnn_result": crnn_text,
-            "caps_result": tagged_input, # Zwracamy to, co naprawdę widział Transformer, dla debugowania
+            "caps_result": tagged_input,
             "final_result": final_text,
             "is_semantic_rejected": is_rejected,
-            "uncertain_zones": unc_mask,
+            "uncertain_zones": char_unc_mask,
             "caps_confidence": round(caps_conf, 3),
             "hybrid_confidence": round(float(hybrid_conf), 3),
             "dynamic_alpha": round(alpha, 2)
@@ -841,82 +1154,180 @@ class CascadeRefinementNetwork:
         if self.matrix_path is None and matrix_dir is not None:
             self.matrix_path = os.path.join(matrix_dir, "confusion_matrix.npy")
 
-        # Selektor odpowiada za precyzyjne wskazywanie 'podejrzanych' fragmentów obrazu
-        self.region_selector = DubiousRegionSelector(char_list, matrix_dir)
-
         self.caps_net = capsnet_predictor
         self.encoder = encoder_obj
         self.char_list = char_list
         self.device = next(capsnet_predictor.parameters()).device
 
-        # Obsługa tokena sygnalizującego niepewność (~) dla Transformera
-        self.lc_token = "~"
-        self.lc_idx = self.encoder.char_to_idx.get(self.lc_token, len(char_list))
+        self.char_to_idx = getattr(self.encoder, "char_to_num", getattr(self.encoder, "char_to_idx", {}))
+        self.idx_to_char = getattr(self.encoder, "num_to_char", getattr(self.encoder, "idx_to_char", None))
 
-        # Mapowanie wyjść CapsNet na alfabet EMNIST-62
-        self.caps_mapping = self._get_emnist_62_mapping()
+        self.lc_token = "~"
+        self.lc_idx = self.char_to_idx.get(self.lc_token, len(char_list))
+
+        if self.idx_to_char is not None:
+            self.caps_mapping = self.idx_to_char
+        else:
+            self.caps_mapping = {0: '[blank]', **{i + 1: c for i, c in enumerate(char_list)}}
+
+        split_risky_chars = self._load_split_risky_chars(matrix_dir)
+        self.region_selector = DubiousRegionSelector(char_list, split_risky_chars)
+
         self.caps_net.eval()
 
+    def _load_split_risky_chars(self, matrix_dir: str | None, error_threshold: float = 0.15) -> list[str]:
+        """ Wczytuje ryzykowne znaki lub wyznacza je z confusion_matrix.npy (obsługuje 93x93 i 94x94). """
+        if matrix_dir is not None:
+            # Domyślnie wczytujemy z pliku JSON, jeśli istnieje, aby uniknąć kosztownej analizy macierzy pomyłek
+            for fname in ("split_risky_chars.json", "risky_chars.json"):
+                json_path = os.path.join(matrix_dir, fname)
+                if os.path.exists(json_path):
+                    with open(json_path, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                    return list(data["risky_chars"] if isinstance(data, dict) else data)
+
+        # Jeśli nie ma pliku JSON, analizujemy macierz pomyłek, aby znaleźć znaki o wysokim wskaźniku błędu
+        if self.matrix_path is not None and os.path.exists(self.matrix_path):
+            cm = np.load(self.matrix_path)
+            has_blank_row = cm.shape[0] == len(self.char_list) + 1
+            risky = []
+            # Przechodzimy przez wszystkie znaki i obliczamy wskaźnik błędu dla każdego wiersza macierzy pomyłek
+            for i, ch in enumerate(self.char_list):
+                cm_idx = i + 1 if has_blank_row else i
+                if ch in ("[blank]", self.lc_token) or cm_idx >= cm.shape[0]:
+                    continue
+                row_sum = float(cm[cm_idx].sum())
+                if row_sum > 0:
+                    # Obliczamy wskaźnik błędu jako 1 - (prawidłowe przewidywania / suma wiersza)
+                    error_rate = 1.0 - (float(cm[cm_idx, cm_idx]) / row_sum)
+                    if error_rate >= error_threshold:
+                        risky.append(ch)
+            return risky
+
+        return []
+
+    def _get_char_threshold(self, char: str, base_threshold: float = 0.85, min_thresh: float = 0.72, max_thresh: float = 0.92) -> float:
+        """ Wyznacza i cachuje indywidualny próg interwencji CapsNetu na podstawie rozkładu błędów w confusion_matrix.npy. """
+        if not hasattr(self, "_char_thresholds") or self._char_thresholds is None:
+            self._char_thresholds = {}
+            if getattr(self, "matrix_path", None) and os.path.exists(self.matrix_path):
+                try:
+                    # Wczytujemy macierz pomyłek i obliczamy wskaźniki błędów dla każdego znaku, aby ustalić dynamiczne progi
+                    cm = np.load(self.matrix_path).astype(np.float64)
+                    has_blank_row = cm.shape[0] == len(self.char_list) + 1
+                    raw_errors = {}
+
+                    for i, ch in enumerate(self.char_list):
+                        cm_idx = i + 1 if has_blank_row else i
+                        if ch in ("[blank]", self.lc_token) or cm_idx >= cm.shape[0]:
+                            continue
+                        row_sum = float(cm[cm_idx].sum())
+                        if row_sum > 0:
+                            # Obliczamy wskaźnik błędu jako 1 - (prawidłowe przewidywania / suma wiersza)
+                            raw_errors[ch] = 1.0 - (float(cm[cm_idx, cm_idx]) / row_sum)
+
+                    if raw_errors:
+                        """ Punkt nasycenia wyznaczany dynamicznie z rozkładu błędów danego checkpointu CRNN, dajemy tylko 10%
+                            najwyższych wartości, aby uniknąć ekstremalnych outlierów. """
+                        saturation_err = max(float(np.percentile(list(raw_errors.values()), 90)), 1e-6)
+                        for ch, err in raw_errors.items():
+                            norm_err = min(max(err / saturation_err, 0.0), 1.0)
+                            self._char_thresholds[ch] = max_thresh - norm_err * (max_thresh - min_thresh)
+                except (OSError, ValueError):
+                    self._char_thresholds = {}
+
+        return self._char_thresholds.get(char, base_threshold)
+
     def refine_logits(self, crnn_probs: torch.Tensor, image_tensor: torch.Tensor, context_map: torch.Tensor = None, force_intensive: bool = False):
-        """ Kaskadowa optymalizacja: CapsNet weryfikuje 'dubious regions' z CRNN. Wykorzystuje mechanizm Deep Fusion (Context 1024d). """
+        """Kaskadowa optymalizacja z dynamicznym progiem CapsNetu skalibrowanym pod macierz pomyłek CRNN."""
+        # Usuwamy nadmiarowy wymiar wsadu (1, B, C, H, W) -> (B, C, H, W), jeśli występuje
         if image_tensor.dim() == 5:
             image_tensor = image_tensor.squeeze(0)
 
-        # Szerokość obrazu do mapowania kroków czasowych na piksele
         width = image_tensor.shape[-1]
         device = crnn_probs.device
 
-        # Selekcja grup na podstawie entropii i macierzy pomyłek
-        groups = self.select_dubious_groups(
+        # Wybór podejrzanych kroków czasowych CRNN na podstawie entropii, marginu oraz macierzy pomyłek
+        groups = self.region_selector.select_dubious_groups(
             crnn_probs,
             width,
-            self.encoder.char_to_idx,
-            self.matrix_path,
-            intensive=force_intensive
+            confusion_matrix_path=self.matrix_path or "",
+            intensive=force_intensive,
+            merge=False,
         )
 
+        # Maska niepewności dla generatora tagów <unc> (ByT5) oraz pusta struktura diagnostyczna dla UI
         uncertainty_mask = torch.zeros(crnn_probs.size(0), dtype=torch.int32, device=device)
+        empty_debug = {
+            "batch_metadata": [],
+            "metadata": {"uncertain_boxes": [], "interventions": []},
+            "tensors": None,
+            "contexts": None,
+        }
+
+        # Pomocnicza funkcja gwarantująca spójny zwrot log-prawdopodobieństw także przy wczesnym wyjściu
+        def _ensure_log_probs(probs_tensor: torch.Tensor) -> torch.Tensor:
+            if probs_tensor.min() >= 0.0:
+                return torch.log(probs_tensor.clamp(min=1e-8))
+            return probs_tensor
 
         if not groups:
-            return crnn_probs, uncertainty_mask.cpu().tolist(), 1.0
+            return _ensure_log_probs(crnn_probs), uncertainty_mask.cpu().tolist(), 1.0, empty_debug
 
         batch_tensors, batch_contexts, batch_metadata = [], [], []
-
-        # Pre-generacja zerowego kontekstu (optymalizacja)
         zero_context = torch.zeros(1024, device=device)
 
         for g in groups:
+            # Wyznaczamy reprezentatywny krok czasowy (wyznaczający środek) oraz granice poziome wycinka
             mid_cand = g[len(g) // 2]
             t_idx = mid_cand['timestep']
+            x1 = max(0, int(min(c['x1'] for c in g)))
+            x2 = min(width, int(max(c['x2'] for c in g)))
 
-            # Wycięcie fragmentu dla CapsNet
-            crop = image_tensor[..., mid_cand['x1']:mid_cand['x2']]
+            # Odrzucamy zbyt wąskie wycinki (szum lub artefakty na krawędziach)
+            crop = image_tensor[..., x1:x2]
             if crop.shape[-1] < 8:
                 continue
 
-            # Normalizacja i zmiana rozmiaru pod CapsNet
-            if crop.dim() == 3: crop = crop.unsqueeze(0)
+            # Skalowanie wycinka do stałego rozmiaru 64x64 wymaganego przez CapsNet
+            if crop.dim() == 3:
+                crop = crop.unsqueeze(0)
             crop_resized = func.interpolate(crop, size=(64, 64), mode='bilinear', align_corners=False)
-            
-            # Odwracamy polaryzację z CRNN (czarny atrament na białym) dla CapsNetu
-            crop_inverted = 1.0 - crop_resized
-            
-            # Aplikujemy oficjalną normalizację eMNIST
-            crop_norm = (crop_inverted - 0.1307) / 0.3081
+
+            # Ujednolicenie polaryzacji (jasny atrament na ciemnym tle) oraz normalizacja Z-score
+            if crop_resized.min() >= 0.0:
+                if crop_resized.max() > 1.0:
+                    crop_resized = crop_resized / 255.0
+                crop_inv = 1.0 - crop_resized if crop_resized.mean() > 0.5 else crop_resized
+                crop_norm = (crop_inv - 0.1307) / 0.3081
+            else:
+                # Tensor jest już po standaryzacji Z-score (zawiera wartości ujemne)
+                crop_norm = crop_resized
+
             batch_tensors.append(crop_norm)
 
-            # Pobranie kontekstu rekurencyjnego
+            # Dopasowanie wymiaru wektora kontekstowego BiLSTM do oczekiwanego przez CapsNet wejścia 1024D
             if context_map is not None:
-                ctx = context_map[min(t_idx, context_map.size(0) - 1)].view(-1)
+                raw_ctx = context_map[min(t_idx, context_map.size(0) - 1)].view(-1)
+                if raw_ctx.numel() < 1024:
+                    ctx = torch.zeros(1024, device=device, dtype=raw_ctx.dtype)
+                    ctx[:raw_ctx.numel()] = raw_ctx
+                else:
+                    ctx = raw_ctx[:1024]
             else:
                 ctx = zero_context
+
             batch_contexts.append(ctx)
-            batch_metadata.append({'timestep': t_idx})
+            batch_metadata.append({
+                'timestep': t_idx,
+                'x1': x1,
+                'x2': x2,
+            })
 
         if not batch_tensors:
-            return crnn_probs, uncertainty_mask.cpu().tolist(), 1.0
+            return _ensure_log_probs(crnn_probs), uncertainty_mask.cpu().tolist(), 1.0, empty_debug
 
-        # Batchowa inferencja CapsNet (multimodalna)
+        # Wsadowa inferencja CapsNet dla wszystkich wyciętych kandydatów jednocześnie
         with torch.no_grad():
             input_batch = torch.cat(batch_tensors)
             context_batch = torch.stack(batch_contexts)
@@ -924,33 +1335,76 @@ class CascadeRefinementNetwork:
             caps_output = self.caps_net(input_batch, word_context=context_batch)
             caps_probs = caps_output["norms"]
 
-        top_probs, top_indices = torch.topk(caps_probs, 2, dim=1)
+        # Pobieramy dwie najbardziej prawdopodobne klasy z CapsNetu do obliczenia pewności i marginu
+        top_probs, top_indices = torch.topk(caps_probs, min(2, caps_probs.size(1)), dim=1)
         confidences = []
+        interventions = []
+        uncertain_boxes = []
 
-        # Proces nadpisywania logitów
-        refined_probs = crnn_probs.clone()  # Unikamy in-place na oryginale
+        # Konwersja wejścia CRNN do liniowych prawdopodobieństw przed miękką fuzją
+        base_probs = torch.softmax(crnn_probs, dim=-1) if crnn_probs.min() < 0 else crnn_probs.clone()
+        refined_probs = base_probs.clone()
+
+        # Mapowanie znaków CapsNetu na indeksy CRNN, aby umożliwić fuzję rozkładów prawdopodobieństwa
+        char_to_idx = getattr(self, "char_to_idx", getattr(self.encoder, "char_to_num", {}))
 
         for i, meta in enumerate(batch_metadata):
             t = meta['timestep']
-            margin = (top_probs[i, 0] - top_probs[i, 1]).item()
-            confidences.append(top_probs[i, 0].item())
+            top_conf = top_probs[i, 0].item()
+            margin = (top_probs[i, 0] - top_probs[i, 1]).item() if top_probs.size(1) > 1 else top_conf
+            confidences.append(top_conf)
 
-            # Jeśli CapsNet się waha, oznaczamy to dla Transformera
-            if margin < 0.2:
+            char_code = top_indices[i, 0].item()
+            char = self.caps_mapping.get(char_code, '?')
+            meta['char'] = char
+
+            dynamic_thresh = self._get_char_threshold(char)
+
+            if top_conf > dynamic_thresh and margin >= 0.15:
+                # CapsNet przekroczył próg pewności, więc dodajemy jego predykcję do rozkładu prawdopodobieństwa CRNN
+                idx = char_to_idx.get(char)
+                if idx is not None and idx < refined_probs.size(-1):
+                    # Waga alpha zachowuje alternatywne hipotezy CRNN dla dekodera CTC i modelu ByT5
+                    alpha = min(0.88, max(0.65, top_conf))
+                    refined_probs[t, :] *= (1.0 - alpha)
+                    refined_probs[t, idx] += alpha
+                    refined_probs[t, :] = refined_probs[t, :] / refined_probs[t, :].sum()
+
+                    interventions.append({
+                        "timestep": t,
+                        "x1": meta["x1"],
+                        "x2": meta["x2"],
+                        "caps_char": char,
+                        "caps_conf": top_conf,
+                        "threshold_used": round(dynamic_thresh, 3),
+                    })
+            else:
+                # Region niepewny w CRNN, którego CapsNet nie rozstrzygnął z wymaganą pewnością
                 uncertainty_mask[t] = 1
-
-            # Próg interwencji: CapsNet musi być pewny swego
-            if top_probs[i, 0] > 0.85:
-                char_code = top_indices[i, 0].item()
-                char = self.caps_mapping.get(char_code, '?')
-                idx = self.encoder.char_to_idx.get(char)
-
-                if idx is not None:
-                    refined_probs[t, :] *= 0.1
-                    refined_probs[t, idx] = 15.0
+                uncertain_boxes.append({
+                    "timestep": t,
+                    "x1": meta["x1"],
+                    "x2": meta["x2"],
+                    "caps_char": char,
+                    "caps_conf": top_conf,
+                    "margin": margin,
+                })
 
         avg_caps_conf = sum(confidences) / len(confidences) if confidences else 1.0
-        return refined_probs, uncertainty_mask.cpu().tolist(), avg_caps_conf
+
+        debug_data = {
+            "batch_metadata": batch_metadata,
+            "metadata": {
+                "uncertain_boxes": uncertain_boxes,
+                "interventions": interventions,
+            },
+            "tensors": input_batch.detach().cpu(),
+            "contexts": context_batch.detach().cpu(),
+        }
+
+        # Powrót do skali logarytmicznej wymaganej przez dekoder CTC
+        refined_log_probs = torch.log(refined_probs.clamp(min=1e-8))
+        return refined_log_probs, uncertainty_mask.cpu().tolist(), avg_caps_conf, debug_data
 
     @staticmethod
     def _get_emnist_62_mapping():
@@ -971,15 +1425,25 @@ class CascadeRefinementNetwork:
     def select_dubious_groups(crnn_probs, width, char_to_idx, confusion_matrix_path, intensive=False):
         """ Identyfikuje regiony obrazu, przy których model CRNN wykazuje wysoką niepewność predykcji.
             Logika działania:
-            1. Oblicza entropię Shannona dla każdego kroku czasowego sekwencji.
-               Wysoka entropia oznacza, że rozkład prawdopodobieństwa jest płaski (model nie jest pewny).
+            1. Przelicza logity/log_probs na rozkład prawdopodobieństwa [0, 1] i wybiera klatki poniżej progu.
             2. Mapuje kroki czasowe na współrzędne pikselowe obrazu wejściowego, uwzględniając
                skalowanie wynikające z architektury sieci.
             3. Grupuje sąsiadujące kroki o niskiej ufności w spójne regiony. """
         steps = crnn_probs.shape[0]
-        if steps == 0: return []
+        if steps == 0:
+            return []
 
-        top1_p, top1_idx = torch.max(crnn_probs, dim=-1)
+        is_probs = (
+            crnn_probs.min() >= 0.0
+            and crnn_probs.max() <= 1.0
+            and torch.allclose(
+                crnn_probs.sum(dim=-1),
+                torch.ones(steps, device=crnn_probs.device, dtype=crnn_probs.dtype),
+                atol=1e-2,
+            )
+        )
+        probs = crnn_probs if is_probs else torch.softmax(crnn_probs, dim=-1)
+        top1_p, top1_idx = torch.max(probs, dim=-1)
 
         # Obliczamy szerokość jednego kroku
         stride = width / steps
@@ -992,17 +1456,23 @@ class CascadeRefinementNetwork:
 
         # Logika Smart Adaptive Thresholding
         try:
-            if os.path.exists(confusion_matrix_path):
+            if confusion_matrix_path and os.path.exists(confusion_matrix_path):
                 cm = np.load(confusion_matrix_path).astype(np.float64)
                 row_sums = cm.sum(axis=1)
                 errors_per_char = row_sums - np.diag(cm)
-                confusing_indices = set(np.argsort(errors_per_char)[-15:])
+                mapping_has_blank = (
+                    0 in char_to_idx.values() or "[blank]" in char_to_idx
+                )
+                if mapping_has_blank:
+                    offset = 1 if cm.shape[0] == len(char_to_idx) - 1 else 0
+                else:
+                    offset = 1 if cm.shape[0] == len(char_to_idx) + 1 else 0
+                confusing_indices = {int(idx) + offset for idx in np.argsort(errors_per_char)[-15:]}
             else:
                 confusing_indices = set()
         except (OSError, ValueError, TypeError, AttributeError) as e:
-                # OSError: błędy dysku, ValueError: błąd unpickling, TypeError/AttributeError: błędy NumPy
-                tqdm.write(f"[{now()}] Błąd Smart Thresholding: {e}. Używam domyślnych progów.")
-                confusing_indices = set()
+            tqdm.write(f"[{now()}] Błąd Smart Thresholding: {e}. Używam domyślnych progów.")
+            confusing_indices = set()
 
         # Klasy ryzykowne (rozbicia sekwencji)
         split_components = {"r", "n", "i", "l", "c", "v", "u"}
@@ -1028,7 +1498,8 @@ class CascadeRefinementNetwork:
                     'x2': min(width, center_x + half_window)
                 })
 
-        if not candidates: return []
+        if not candidates:
+            return []
 
         # Grupowanie bliskich niepewności
         groups, current = [], [candidates[0]]
@@ -1040,7 +1511,7 @@ class CascadeRefinementNetwork:
                 current = [candidates[i]]
         groups.append(current)
         return groups
-
+    
     @staticmethod
     def save_transformer_training_set(data, filename="user_transformer_hard_cases.json"):
         """ Zapisuje dane wygenerowane przez wizję do formatu akceptowalnego przez Transformera. """
@@ -1261,16 +1732,19 @@ def get_contextual_data_cached(pipeline, layout_engine, forms_dict, char_list, c
     np.save(matrix_path, matrix)
     return real_pairs, matrix
 
+
 # Ładujemy metrykę raz, na poziomie modułu
 cer_metric = load("cer")
-def compute_metrics(eval_preds, tokenizer):
+def compute_metrics(eval_preds, tokenizer=None):
     """ Oblicza CER dla Transformera (ByT5/T5). """
     preds, labels = eval_preds
     if isinstance(preds, tuple):
         preds = preds[0]
 
-    # Zastępujemy -100 (maska straty) ID padu, aby tokenizer mógł to zdekodować
-    labels = np.where(labels != -100, labels, tokenizer.pad_token_id)
+    # Zastępujemy -100 (maska straty) ID padu, aby tokenizer mógł to zdekodować (zarówno w preds, jak i w labels)
+    pad_id = tokenizer.pad_token_id if tokenizer is not None else 0
+    preds = np.where(preds != -100, preds, pad_id)
+    labels = np.where(labels != -100, labels, pad_id)
 
     # Dekodowanie bajtów/znaków na tekst
     decoded_preds = tokenizer.batch_decode(preds, skip_special_tokens=True)
@@ -1285,26 +1759,39 @@ def compute_metrics(eval_preds, tokenizer):
 
     return {"cer": cer}
 
+
 def set_user_expert(self, user_id):
-    """ Dynamicznie przełącza wagi LoRA dla użytkownika. """
+    """Dynamicznie przełącza wagi LoRA oraz bazę wiedzy autora w locie."""
     adapter_name = f"adapter_{user_id}"
     adapter_dir = f"/app/user_data/{user_id}/lora_weights"
 
-    # Jeśli brak profilu na dysku, to czysty Transformer
+    # Przełączamy pamięć słownikową
+    self.author_memory = PersistentAuthorMemory(user_id)
+
     if not os.path.exists(adapter_dir):
-        self.model.disable_adapter_layers()
+        if isinstance(self.model, PeftModel):
+            self.model.disable_adapter_layers()  # Powrót do czystego modelu
         return
 
-    # Jeśli profil jest, ale nie ma go w RAM, to ładujemy model personalizowany
-    if adapter_name not in self.loaded_adapters:
+    # Jeśli model bazowy nie jest jeszcze opakowany w PeftModel, inicjalizujemy go pierwszym adapterem
+    if not isinstance(self.model, PeftModel):
+        self.model = PeftModel.from_pretrained(
+            self.model,
+            adapter_dir,
+            adapter_name=adapter_name,
+        ).to(self.device)
+        self.model.eval()
+        self.loaded_adapters.append(adapter_name)
+    elif adapter_name not in self.loaded_adapters:
         self.model.load_adapter(adapter_dir, adapter_name=adapter_name)
         self.loaded_adapters.append(adapter_name)
 
-    # Aktywacja konkretnej wiedzy eksperckiej
+    # Aktywacja wag konkretnego użytkownika
     self.model.enable_adapter_layers()
     self.model.set_adapter(adapter_name)
 
-def run_transformer_adaptation(json_data_path, model_path, output_path, matrix_path, encoder):
+
+def run_transformer_adaptation(json_data_path, model_path, output_path, matrix_path, encoder, language="pl"):
     """ Funkcja do personalizacji modelu ByT5 na błędach specyficznych dla użytkownika.
         Wczytuje wstępnie wytrenowany model i dotrenowuje go na dostarczonych przykładach. """
     print(f"[{time.strftime('%H:%M:%S')}] Rozpoczynam adaptację Transformera dla użytkownika.")
@@ -1318,13 +1805,20 @@ def run_transformer_adaptation(json_data_path, model_path, output_path, matrix_p
         user_data = json.load(f)
 
     # Przygotowanie danych w formacie dla Dataset
+    lang_tag = f"<{language}>"
     user_pairs = []
     for item in user_data:
         # Formatowanie: wejście (to co widzi wizja) -> cel (poprawny tekst)
-        vision_output = item.get("vision_output", "")
-        ground_truth = item.get("ground_truth", "")
+        vision_output = item.get("vision_output", item.get("input", ""))
+        ground_truth = item.get("ground_truth", item.get("target", ""))
+
         # Symulacja pustego kontekstu, skupiamy się na naprawie słowa/linii
-        user_pairs.append({"context": "", "input": vision_output, "target": ground_truth})
+        raw_ctx = item.get("context", "")
+        user_pairs.append({
+            "context": f"{lang_tag} {raw_ctx}".strip(),
+            "input": vision_output,
+            "target": ground_truth,
+        })
 
     print(f"[{time.strftime('%H:%M:%S')}] Wczytano {len(user_pairs)} próbek do personalizacji.")
 
@@ -1355,21 +1849,16 @@ def run_transformer_adaptation(json_data_path, model_path, output_path, matrix_p
     # Ładowanie modelu bazowego
     base_model = T5ForConditionalGeneration.from_pretrained(model_path)
 
-    # Konfiguracja LoRA (Low-Rank Adaptation) - Trenujemy tylko warstwy atencji (q, v), reszta sieci jest zamrożona.
+    """ Konfiguracja LoRA (Low-Rank Adaptation) — zamraża wagi bazowe ByT5 i trenuje
+        wyłącznie niskorangowe adaptery (r=16, alpha=32) w dwóch grupach warstw:
+        - Projekcje atencji ("q", "k", "v", "o"): kierują uwagę modelu na zaszumione
+          fragmenty tekstu OCR oraz obsługują prefixy bilingwalne (<pl>, <en>).
+        - Bloki Feed-Forward ("wi_0", "wi_1", "wo"): dopasowują słownictwo i reguły
+          gramatyczne do specyfiki pisma użytkownika bez ryzyka halucynacji. """
     lora_config = LoraConfig(
         r=16,
         lora_alpha=32,
-        target_modules=[
-            "q", "k", "v", "o",
-            """ Warstwy Atencji (Multi-head Attention): Odpowiadają za dynamiczne kierowanie uwagi 
-                modelu na istotne glify w zaszumionym tekście OCR oraz rozumienie instrukcji 
-                zawartych w prefixach bilingwalnych <pl> i <en>. """,
-
-            "wi_0", "wi_1", "wo",
-            """ Bloki Feed-Forward (FFN): Pełnią rolę 'pamięci masowej' modelu, przechowując 
-                wiedzę o słownictwie i strukturach gramatycznych obu języków. Ich adaptacja 
-                jest kluczowa dla skutecznej korekty semantycznej i unikania halucynacji. """
-        ],
+        target_modules=["q", "k", "v", "o", "wi_0", "wi_1", "wo"],
         lora_dropout=0.1,
         bias="none",
         task_type=TaskType.SEQ_2_SEQ_LM
@@ -1390,32 +1879,36 @@ def run_transformer_adaptation(json_data_path, model_path, output_path, matrix_p
     )
 
     # Parametry fine-tuningu (znacznie krótszy i łagodniejszy trening niż główny)
+    use_bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
     training_args = Seq2SeqTrainingArguments(
         output_dir=output_path,
-        num_train_epochs=3,  # Krótki fine-tuning, aby uniknąć overfittingu do małej próbki
-        per_device_train_batch_size=2,
-        gradient_accumulation_steps=16,
-        learning_rate=2e-5,  # Mniejszy learning rate (dociąganie)
+        num_train_epochs=3,
+        per_device_train_batch_size=1,
+        gradient_accumulation_steps=32,
+        learning_rate=2e-5,
         weight_decay=0.01,
-        fp16=True,
-        gradient_checkpointing=True, # Zmniejsza zużycie vRAM
-        optim="adamw_torch_fused", # Fused jest szybsza i lżejsza (może się zmieści na 4gb vRAM)
-        save_strategy="no",  # Nie zapisujemy checkpointów pośrednich
+        fp16=False,
+        bf16=use_bf16,
+        gradient_checkpointing=True,
+        optim="adafactor",
+        eval_strategy="epoch",
+        save_strategy="epoch",
+        save_total_limit=1,
         logging_steps=10,
         report_to="none",
-        load_best_model_at_end=True,  # Pozwala na załadowanie najlepszych wag po treningu
-        metric_for_best_model="cer",  # Wskazuje na metrykę CER, jako wskaźnik jakości
-        greater_is_better=False,  # Informuje, że mniejszy CER = lepszy model
-        predict_with_generate=True  # Niezbędne do poprawnego obliczania metryk tekstowych
-
+        load_best_model_at_end=True,
+        metric_for_best_model="cer",
+        greater_is_better=False,
+        predict_with_generate=True,
+        generation_max_length=256
     )
 
-    if train_ds is not None:
+    if len(train_ds) > 1:
         # Obliczamy rozmiary (90% na trening, reszta na walidację)
-        train_size = int(0.9 * len(train_ds))
+        train_size = max(1, int(0.9 * len(train_ds)))
         val_size = len(train_ds) - train_size
 
-        # Zapewnia to, że przy każdym uruchomieniu te same próbki trafią do walidacji.
+        # Zapewnia to, że przy każdym uruchomieniu te same próbki trafią do walidacji
         train_ds, val_ds = random_split(
             train_ds,
             [train_size, val_size],
@@ -1424,8 +1917,9 @@ def run_transformer_adaptation(json_data_path, model_path, output_path, matrix_p
 
         tqdm.write(f"[{now()}] Podział zakończony: Train={len(train_ds)}, Val={len(val_ds)}")
     else:
-        val_ds = None
+        val_ds = train_ds
 
+    adapt_epoch_cb = EpochProgressCallback(stage_name="ByT5 LoRA Adapt")
     trainer = Seq2SeqTrainer(
         model=model,
         args=training_args,
@@ -1433,9 +1927,10 @@ def run_transformer_adaptation(json_data_path, model_path, output_path, matrix_p
         eval_dataset=val_ds,
         processing_class=tokenizer,
         data_collator=data_collator,
-        compute_metrics=compute_metrics,
+        compute_metrics=partial(compute_metrics, tokenizer=tokenizer),
         callbacks=[
-            EarlyStoppingCallback(early_stopping_patience=3)  # Stop po 3 epokach bez poprawy
+            EarlyStoppingCallback(early_stopping_patience=3),
+            adapt_epoch_cb,
         ]
     )
 
@@ -1467,10 +1962,13 @@ def apply_stochastic_lth_step(model, initial_state_dict, base_amount=0.05, mode=
                 jitter = random.uniform(0.8, 1.2)
                 actual_amount = min(0.99, base_amount * jitter)
                 prune.l1_unstructured(module, name='weight', amount=actual_amount)
+                # Utrwalamy wyzerowane wagi w tensorze weight, aby nie psuć kluczy state_dict przy load_best_model_at_end
+                prune.remove(module, 'weight')
 
             elif mode == "random":
                 # Usuwa losowe wagi niezależnie od ich wielkości
                 prune.random_unstructured(module, name='weight', amount=base_amount)
+                prune.remove(module, 'weight')
 
 
 class StochasticPruningCallback(TrainerCallback):
@@ -1545,10 +2043,14 @@ def run_full_training():
     seed_everything(SEED)
     print(f"[{now()}] START: Trening bilingwalny (PL + EN). Urządzenie: {DEVICE}")
 
+    results_dir = globals().get("RESULTS_DIR", os.path.join(os.path.dirname(CHECKPOINT_BASE), "results"))
+    os.makedirs(results_dir, exist_ok=True)
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
     real_pairs_pl = []
     real_pairs_en = []
 
-    # POPRAWKA: Twarde definiowanie alfabetu, by wyeliminować błąd braku zapisu 'char_list' w Checkpoincie CRNN
+    # Definiowanie alfabetu (92 znaki + [blank] na indeksie 0)
     chars_raw = [
         '!', '"', "'", '(', ')', ',', '-', '.', '/', 
         '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 
@@ -1562,189 +2064,294 @@ def run_full_training():
         'Ó', 'ó', 'Ą', 'ą', 'Ć', 'ć', 'Ę', 'ę', 'Ł', 'ł', 
         'Ń', 'ń', 'Ś', 'ś', 'Ź', 'ź', 'Ż', 'ż'            
     ]
-    
-    # +1 ponieważ HTREncoder zawsze dodaje techniczny znak [blank] na pozycji 0
-    num_classes_total = len(chars_raw) + 1 
+    num_classes_total = len(chars_raw) + 1
 
-    # Ładowanie danych z macierzy pomyłek (dla generatora szumu)
-    if os.path.exists(CACHE_MATRIX):
-        confusion_matrix = np.load(CACHE_MATRIX)
-        print(f"[{now()}] Załadowano macierz pomyłek z cache.")
-    else:
-        confusion_matrix = np.zeros((len(chars_raw), len(chars_raw)))
-        print(f"[{now()}] Warning: Brak macierzy pomyłek. Używam zerowej.")
+    # Ładowanie macierzy pomyłek (dla generatora szumu)
+    gen_matrix_path = os.path.join(results_dir, "smart_confusion_matrix.npy")
+    confusion_matrix = np.zeros((len(chars_raw), len(chars_raw)), dtype=np.float32)
 
-    # Błędy polskie
-    PL_JSON_PATH = os.path.join(BASE_DIR, "transformer_train_pl_pages.json")
-    if os.path.exists(PL_JSON_PATH):
-        with open(PL_JSON_PATH, 'r', encoding='utf-8') as f:
+    if os.path.exists(gen_matrix_path):
+        loaded_cm = np.load(gen_matrix_path)
+        if loaded_cm.shape == confusion_matrix.shape and np.sum(loaded_cm) > 0:
+            confusion_matrix = loaded_cm
+            np.save(CACHE_MATRIX, confusion_matrix)
+            print(f"[{now()}] Załadowano macierz pomyłek z {gen_matrix_path}.")
+    elif os.path.exists(CACHE_MATRIX):
+        loaded_cm = np.load(CACHE_MATRIX)
+        if loaded_cm.shape == confusion_matrix.shape:
+            confusion_matrix = loaded_cm
+            print(f"[{now()}] Załadowano macierz pomyłek z cache.")
+
+    if np.sum(confusion_matrix) == 0:
+        print(f"[{now()}] Warning: Brak niezerowej macierzy pomyłek. Używam zerowej.")
+
+    # Wczytywanie polskich par z RESULTS_DIR (z fallbackiem do BASE_DIR)
+    pl_json_path = os.path.join(results_dir, "transformer_train_pl_pages.json")
+    if not os.path.exists(pl_json_path):
+        pl_json_path = os.path.join(BASE_DIR, "transformer_train_pl_pages.json")
+
+    if os.path.exists(pl_json_path):
+        with open(pl_json_path, 'r', encoding='utf-8') as f:
             real_pairs_pl = json.load(f)
-        print(f"[{now()}] Wczytano {len(real_pairs_pl)} polskich par.")
+        print(f"[{now()}] Wczytano {len(real_pairs_pl)} polskich par z {pl_json_path}.")
+    else:
+        print(f"[{now()}] Warning: Nie znaleziono pliku z polskimi parami ({pl_json_path}).")
 
-    # Angielskie
+    # Wczytywanie lub generowanie par angielskich (IAM)
     if os.path.exists(CACHE_PAIRS):
         with open(CACHE_PAIRS, 'r', encoding='utf-8') as f:
             real_pairs_en = json.load(f)
         print(f"[{now()}] Wczytano {len(real_pairs_en)} angielskich par z cache.")
-    else:
-        # Generowanie EN, jeśli brak cache
+    elif os.path.exists(SENTENCES_TXT) and os.path.exists(FORMS_DIR):
         from Models.ResNetCRNNWordRecognition import ResNetCRNN
         print(f"[{now()}] Generowanie danych EN z IAM.")
-        
-        # POPRAWKA: Bezpieczne instancjowanie modeli na bazie kompletnego słownika
-        model_crnn = ResNetCRNN(num_classes_total).to(DEVICE)
+
         ckpt = torch.load(CRNN_CHECKPOINT, map_location=DEVICE)
-        model_crnn.load_state_dict(ckpt["model_state"])
-        
-        model_caps = CapsNet(num_classes_total, context_dim=1024).to(DEVICE)
-        model_caps.load_state_dict(torch.load(CAPS_CHECKPOINT, map_location=DEVICE)["model_state"])
-        
-        inference_pipe = CRNNInferencePipeline(model_crnn, chars_raw, DEVICE)
-        inference_pipe.refiner = CascadeRefinementNetwork(model_caps, chars_raw, inference_pipe)
+        sd_crnn = ckpt["model_state"] if isinstance(ckpt, dict) and "model_state" in ckpt else ckpt
+        weight_key = 'output.weight' if 'output.weight' in sd_crnn else ('fc.weight' if 'fc.weight' in sd_crnn else None)
+        n_classes_crnn = sd_crnn[weight_key].shape[0] if weight_key else num_classes_total
+
+        if isinstance(ckpt, dict) and "char_list" in ckpt:
+            crnn_chars = ckpt["char_list"]
+        else:
+            crnn_chars = chars_raw[:n_classes_crnn - 1]
+
+        model_crnn = ResNetCRNN(n_classes_crnn).to(DEVICE)
+        model_crnn.load_state_dict(sd_crnn)
+
+        ckpt_caps = torch.load(CAPS_CHECKPOINT, map_location=DEVICE)
+        sd_caps = ckpt_caps["model_state"] if isinstance(ckpt_caps, dict) and "model_state" in ckpt_caps else ckpt_caps
+        n_classes_caps = ckpt_caps.get("num_classes", num_classes_total) if isinstance(ckpt_caps, dict) else num_classes_total
+
+        model_caps = CapsNet(num_classes=n_classes_caps, context_dim=1024).to(DEVICE)
+        model_caps.load_state_dict(sd_caps)
+
+        inference_pipe = CRNNInferencePipeline(model_crnn, crnn_chars, DEVICE)
+        encoder_obj = getattr(inference_pipe, "encoder", inference_pipe)
+        inference_pipe.refiner = CascadeRefinementNetwork(model_caps, chars_raw, encoder_obj, matrix_path=CACHE_MATRIX)
 
         forms_lines = parse_iam_forms_to_lines(SENTENCES_TXT)
-        real_pairs_en, _ = generate_contextual_noise_data(inference_pipe, forms_lines, chars_raw)
+        real_pairs_en, generated_matrix = generate_contextual_noise_data(inference_pipe, forms_lines, chars_raw)
+
+        if np.sum(confusion_matrix) == 0 and np.sum(generated_matrix) > 0:
+            confusion_matrix = generated_matrix
+            np.save(CACHE_MATRIX, confusion_matrix)
 
         with open(CACHE_PAIRS, 'w', encoding='utf-8') as f:
-            json.dump(real_pairs_en, f)
+            json.dump(real_pairs_en, f, ensure_ascii=False)
 
         del model_crnn, model_caps, inference_pipe
         gc.collect()
         torch.cuda.empty_cache()
+    else:
+        print(f"[{now()}] Pomijam generowanie par EN z IAM (brak {FORMS_DIR} lub {SENTENCES_TXT}).")
 
-    # Łączenie zbiorów <pl> i <en>
-    num_en = len(real_pairs_en)
-    num_pl = len(real_pairs_pl)
+    # Podział na train/val przed, żeby uniknąć wycieku duplikatów do walidacji
+    tagged_pl = [
+        {"context": f"<pl> {p.get('context') or ''}".strip(), "input": p['input'], "target": p['target']}
+        for p in real_pairs_pl
+    ]
+    tagged_en = [
+        {"context": f"<en> {p.get('context') or ''}".strip(), "input": p['input'], "target": p['target']}
+        for p in real_pairs_en
+    ]
 
-    if num_pl > 0 and num_pl < num_en:
-        multiplier = num_en // num_pl
-        real_pairs_pl = real_pairs_pl * multiplier
-        print(f"[{now()}] Wykonano oversampling danych PL (x{multiplier}).")
+    if len(tagged_pl) > 1:
+        train_pl, val_pl = random_split(tagged_pl, [0.95, 0.05], generator=torch.Generator().manual_seed(SEED))
+        train_pl, val_pl = list(train_pl), list(val_pl)
+    else:
+        train_pl, val_pl = tagged_pl, []
 
-    real_context_pairs = []
-    for p in real_pairs_pl:
-        real_context_pairs.append({
-            "context": f"<pl> {p.get('context', '')}",
-            "input": p['input'],
-            "target": p['target']
-        })
-    for p in real_pairs_en:
-        real_context_pairs.append({
-            "context": f"<en> {p.get('context', '')}",
-            "input": p['input'],
-            "target": p['target']
-        })
-    random.shuffle(real_context_pairs)
+    if len(tagged_en) > 1:
+        train_en, val_en = random_split(tagged_en, [0.95, 0.05], generator=torch.Generator().manual_seed(SEED))
+        train_en, val_en = list(train_en), list(val_en)
+    else:
+        train_en, val_en = tagged_en, []
 
-    # Inicjalizacja
+    num_en = len(train_en)
+    num_pl = len(train_pl)
+
+    if num_pl > 0:
+        if num_en > 0 and num_pl < num_en:
+            multiplier = max(1, num_en // num_pl)
+            train_pl = train_pl * multiplier
+            print(f"[{now()}] Wykonano oversampling danych PL (x{multiplier}).")
+        elif num_en == 0 and num_pl < 250:
+            multiplier = max(1, 250 // num_pl)
+            train_pl = train_pl * multiplier
+            print(f"[{now()}] Wykonano oversampling danych PL (x{multiplier}) dla równowagi z korpusem Wiki.")
+
+    train_real = train_pl + train_en
+    val_real = val_pl + val_en
+    random.shuffle(train_real)
+
+    # Inicjalizacja Transformera ByT5 z tokenami specjalnymi
     tokenizer = ByT5Tokenizer.from_pretrained(MODEL_NAME)
     LANGUAGE_TOKENS = ['<pl>', '<en>']
     SPECIAL_TOKENS = [LC_TOKEN, UNC_START, UNC_END] + LANGUAGE_TOKENS
     tokenizer.add_special_tokens({'additional_special_tokens': SPECIAL_TOKENS})
 
-    model_byt5 = T5ForConditionalGeneration.from_pretrained(MODEL_NAME).to(DEVICE)
+    model_byt5 = T5ForConditionalGeneration.from_pretrained(MODEL_NAME)
     model_byt5.resize_token_embeddings(len(tokenizer))
     model_byt5.to(DEVICE)
 
-    # Ładowanie wikipedii
+    # Ładowanie bilingwalnej Wikipedii, dzielimy jeden artykuł na dwie sąsiednie linie kontekstu
     print(f"[{now()}] Pobieranie bilingwalnej Wikipedii.")
-    wiki_pl = load_dataset("wikimedia/wikipedia", "20231101.pl", split="train", streaming=True)
-    wiki_en = load_dataset("wikitext", "wikitext-103-raw-v1", split="train", streaming=True)
-
     wiki_combined_pairs = []
-    pl_iter, en_iter = iter(wiki_pl), iter(wiki_en)
+    try:
+        wiki_pl = load_dataset("wikimedia/wikipedia", "20231101.pl", split="train", streaming=True)
+        wiki_en = load_dataset("wikitext", "wikitext-103-raw-v1", split="train", streaming=True)
+        pl_iter, en_iter = iter(wiki_pl), iter(wiki_en)
 
-    # Tworzymy pary syntetyczne w proporcji 1:1
-    for _ in range(len(real_context_pairs) * 5):
-        try:
-            # Polskie
-            p1, p2 = next(pl_iter)['text'][:200], next(pl_iter)['text'][:200]
-            wiki_combined_pairs.append((f"<pl> {p1}", f"<pl> {p2}"))
-            # Angielskie
-            e1, e2 = next(en_iter)['text'][:200], next(en_iter)['text'][:200]
-            wiki_combined_pairs.append((f"<en> {e1}", f"<en> {e2}"))
-        except StopIteration:
-            break
+        def _next_paired_chunks(iterator):
+            for sample in iterator:
+                txt = re.sub(r'\s+', ' ', sample.get('text', '')).strip()
+                if len(txt) >= 80 and not txt.startswith('='):
+                    split_pt = txt.rfind(' ', 35, min(160, len(txt) - 25))
+                    if split_pt == -1:
+                        split_pt = len(txt) // 2
+                    prev_chunk = txt[:split_pt].strip()
+                    curr_chunk = txt[split_pt:split_pt + 180].strip()
+                    if len(prev_chunk) >= 15 and len(curr_chunk) >= 15:
+                        return prev_chunk, curr_chunk
+            return None, None
 
-    # Tworzenie datasetów
-    train_wiki, val_wiki = random_split(wiki_combined_pairs, [0.95, 0.05])
-    train_real, val_real = random_split(real_context_pairs, [0.95, 0.05])
+        target_wiki_pairs = max((len(train_real) + len(val_real)) * 3, 1000)
+        for _ in range(target_wiki_pairs):
+            p1, p2 = _next_paired_chunks(pl_iter)
+            if not p1 or not p2:
+                break
+            wiki_combined_pairs.append((f"<pl> {p1}", p2))
+
+            e1, e2 = _next_paired_chunks(en_iter)
+            if not e1 or not e2:
+                break
+            wiki_combined_pairs.append((f"<en> {e1}", e2))
+    except KeyboardInterrupt:
+        print(f"[{now()}] Przerwano pobieranie Wikipedii przez użytkownika.")
+    except FileNotFoundError as fnf_error:
+        print(f"[{now()}] Nie znaleziono pliku z Wikipedią: {fnf_error}")
+    except (ConnectionError, TimeoutError, RuntimeError, ValueError, OSError) as e:
+        print(f"[{now()}] Problem podczas pobierania strumienia Wikipedii: {e}")
+    except Exception as e:
+        print(f"[{now()}] Nieznany problem podczas pobierania strumienia Wikipedii: {e}")
+
+    print(f"[{now()}] Przygotowano {len(wiki_combined_pairs)} par z Wikipedii oraz {len(train_real)} train / {len(val_real)} val par rzeczywistych.")
+
+    # Podział na train/val wyłącznie dla Wikipedii + limit rozmiaru walidacji
+    if len(wiki_combined_pairs) > 1:
+        val_wiki_len = min(300, max(1, int(0.05 * len(wiki_combined_pairs))))
+        train_wiki_len = len(wiki_combined_pairs) - val_wiki_len
+        train_wiki, val_wiki = random_split(
+            wiki_combined_pairs, [train_wiki_len, val_wiki_len], generator=torch.Generator().manual_seed(SEED)
+        )
+    else:
+        train_wiki, val_wiki = wiki_combined_pairs, []
 
     error_gen = HybridVisualErrorGenerator(confusion_matrix, chars_raw)
 
-    train_ds = ContextualCurriculumDataset(list(train_wiki), list(train_real), error_gen, tokenizer)
-    val_ds = ContextualCurriculumDataset(list(val_wiki), list(val_real), error_gen, tokenizer)
+    train_ds = ContextualCurriculumDataset(list(train_wiki), train_real, error_gen, tokenizer)
+    val_ds = ContextualCurriculumDataset(list(val_wiki), val_real, error_gen, tokenizer)
+    val_ds.rate = 0.10
+    val_ds.markers = True
 
-    # Trening
-    initial_state_dict = copy.deepcopy(model_byt5.state_dict())
+    if len(val_ds) == 0 and len(train_ds) > 1:
+        train_ds, val_ds = random_split(
+            train_ds,
+            [len(train_ds) - 1, 1],
+            generator=torch.Generator().manual_seed(SEED)
+        )
 
-    data_collator = DataCollatorForSeq2Seq(tokenizer=tokenizer, model=model_byt5, label_pad_token_id=-100, pad_to_multiple_of=8)
+    # Wstępne wygenerowanie próbek walidacyjnych raz, aby nie zmieniały się w trakcie treningu
+    random.seed(SEED)
+    np.random.seed(SEED)
+    fixed_val_ds = [val_ds[i] for i in range(len(val_ds))]
+
+    data_collator = DataCollatorForSeq2Seq(
+        tokenizer=tokenizer,
+        model=model_byt5,
+        label_pad_token_id=-100,
+        pad_to_multiple_of=8
+    )
+    use_bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
 
     training_args = Seq2SeqTrainingArguments(
         output_dir=OUTPUT_DIR,
         num_train_epochs=6,
-        per_device_train_batch_size=1,  # Mały vRAM, ale nadrabiamy akumulacją
-        gradient_accumulation_steps=32,  # Efektywny batch size = 32
-        learning_rate=1e-3,  
+        per_device_train_batch_size=1,
+        per_device_eval_batch_size=8,
+        gradient_accumulation_steps=32,
+        learning_rate=3e-4,
         weight_decay=0.01,
         predict_with_generate=True,
-        fp16=True,
-        optim="adafactor", 
+        generation_max_length=256,
+        fp16=False,
+        bf16=use_bf16,
+        optim="adafactor",
         eval_strategy="epoch",
         save_strategy="epoch",
+        save_total_limit=2,
         logging_steps=20,
         report_to="mlflow",
         load_best_model_at_end=True,
-        metric_for_best_model="cer",  # Transformer ma bić rekordy w CER - działa, jak słownik
-        greater_is_better=False  # Mniejszy CER = lepszy model
+        metric_for_best_model="cer",
+        greater_is_better=False
     )
 
+    pruning_cb = StochasticPruningCallback(None, base_amount=0.1)
+    orig_on_epoch_end = pruning_cb.on_epoch_end
+
+    def _safe_pruning_on_epoch_end(args, state, control, **kwargs):
+        # Pomijamy pruning po 1. epoce, bo model dopiero stabilizuje nowe tokeny specjalne, więc wczesne przycinanie może zniszczyć uczenie
+        if state.epoch is None or state.epoch < 2:
+            return
+        return orig_on_epoch_end(args, state, control, **kwargs)
+
+    pruning_cb.on_epoch_end = _safe_pruning_on_epoch_end
+
+    epoch_cb = EpochProgressCallback(stage_name="ByT5 Main")
     trainer = Seq2SeqTrainer(
         model=model_byt5,
         args=training_args,
         train_dataset=train_ds,
-        eval_dataset=val_ds,
+        eval_dataset=fixed_val_ds,
         processing_class=tokenizer,
-        compute_metrics=compute_metrics,
+        compute_metrics=partial(compute_metrics, tokenizer=tokenizer),
         data_collator=data_collator,
         callbacks=[
-            CurriculumCallback(train_ds), StochasticPruningCallback(initial_state_dict, base_amount=0.1),
-            EarlyStoppingCallback(early_stopping_patience=2)  
+            CurriculumCallback(train_ds),
+            pruning_cb,
+            EarlyStoppingCallback(early_stopping_patience=2),
+            epoch_cb,
         ]
     )
 
-    print(f"[{time.strftime('%H:%M:%S')}] Uruchamianie treningu.")
+    print(f"[{now()}] Uruchamianie treningu.")
     trainer.train()
     trainer.save_model(OUTPUT_DIR)
     tokenizer.save_pretrained(OUTPUT_DIR)
-    print(f"[{time.strftime('%H:%M:%S')}] Trening zakończony. Model zapisany w {OUTPUT_DIR}")
+    print(f"[{now()}] Trening zakończony. Model zapisany w {OUTPUT_DIR}")
 
 
 def run_inference_test():
     """ Uruchamia test inferencji na wytrenowanym modelu Refinera. """
     print(f"[{time.strftime('%H:%M:%S')}] Tryb TESTU INFERENCJI (Walidacja końcowa).")
 
-    # Ładujemy model z folderu wyjściowego
     trained_model_path = OUTPUT_DIR
 
     if not os.path.exists(trained_model_path):
-        print(f"[{now()}] Warning: Nie znaleziono wytrenowanego modelu w {OUTPUT_DIR}. Używam bazy.")
+        print(f"[{now()}] Nie znaleziono wytrenowanego modelu w {OUTPUT_DIR}. Używam bazy.")
         trained_model_path = MODEL_NAME
 
-    # Ładowanie tokenizatora (już powinien mieć zapisane tokeny w OUTPUT_DIR)
     tokenizer = ByT5Tokenizer.from_pretrained(trained_model_path)
 
-    # Jeśli jednak ładujemy bazowy, musimy dodać tokeny i zmienić rozmiar modelu
     if trained_model_path == MODEL_NAME:
-        tokenizer.add_special_tokens({'additional_special_tokens': [LC_TOKEN, UNC_START, UNC_END]})
+        tokenizer.add_special_tokens({'additional_special_tokens': [LC_TOKEN, UNC_START, UNC_END, '<pl>', '<en>']})
 
     model = T5ForConditionalGeneration.from_pretrained(trained_model_path).to(DEVICE)
-
-    # Zawsze synchronizuj rozmiar słownika z modelem
     model.resize_token_embeddings(len(tokenizer))
     model.eval()
 
-    # Sekcja Testowa
     tests = [
         {
             "lang": "pl",
@@ -1760,13 +2367,10 @@ def run_inference_test():
 
     for t in tests:
         print(f"Test dla języka {t['lang'].upper()}")
-
-        # Wywołanie funkcji głównej
-        poprawka = refine_ocr_text(t['noisy'], t['ctx'], model, tokenizer, DEVICE, t['lang'])
-
+        fix = refine_ocr_text(t['noisy'], t['ctx'], model, tokenizer, DEVICE, t['lang'])
         print(f"Kontekst: {t['ctx']}")
         print(f"Wejście (Vision + CapsNet): {t['noisy']}")
-        print(f"Wynik końcowy (Transformer): {poprawka}")
+        print(f"Wynik końcowy (Transformer): {fix}")
 
 if __name__ == "__main__":
     run_full_training()

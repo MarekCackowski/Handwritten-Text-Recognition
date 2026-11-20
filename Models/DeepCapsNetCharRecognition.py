@@ -31,11 +31,26 @@ from torchvision.ops import DeformConv2d
 
 from Preprocessing.Preprocessing import Preprocessing
 
+# Pasek postępu
+try:
+    from run_all import epoch_progress_bar
+except ImportError:
+    def epoch_progress_bar(iterable, total_epochs: int, stage_name: str, initial: int = 0):
+        return tqdm(
+            iterable,
+            total=total_epochs,
+            initial=initial,
+            desc=f"{stage_name} | Epoki",
+            unit="ep",
+            bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]{postfix}",
+            dynamic_ncols=True,
+        )
+
 # Globalne konfiguracje
 warnings.filterwarnings("ignore")
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 cv.setNumThreads(0)
-torch.autograd.set_detect_anomaly(True)
+torch.autograd.set_detect_anomaly(False)
 
 # Konfiguracja MLflow
 try:
@@ -129,9 +144,104 @@ FINAL_NORM = v2.Normalize(mean=EMNIST_NORM_MEAN, std=EMNIST_NORM_STD)
 os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 os.makedirs(DEBUG_DIR, exist_ok=True)
 
+
+def _clean_and_center_crop(img_uint8: np.ndarray, char_hint: str = None) -> np.ndarray:
+    """ Usuwa odseparowane fragmenty sąsiednich liter dotykające bocznych krawędzi wycinka CRNN,
+        zachowuje znaki diakrytyczne i centruje znak środkiem masy na płótnie 64x64. """
+    if img_uint8 is None or img_uint8.size == 0:
+        return np.zeros((64, 64), dtype=np.uint8)
+
+    if np.mean(img_uint8) > 127:
+        img_uint8 = 255 - img_uint8
+
+    _, thresh = cv.threshold(img_uint8, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU)
+    num_labels, labels_cc, stats, _ = cv.connectedComponentsWithStats(thresh, connectivity=8)
+
+    if num_labels <= 1:
+        return cv.resize(img_uint8, (64, 64), interpolation=cv.INTER_AREA)
+
+    # Główna składowa znaku (największe pole atramentu)
+    idx_main = 1 + int(np.argmax(stats[1:, cv.CC_STAT_AREA]))
+    mx, my, mw, mh, marea = stats[idx_main]
+    img_w = img_uint8.shape[1]
+
+    clean_mask = np.zeros_like(thresh)
+    for c in range(1, num_labels):
+        x, y, w, h, area = stats[c]
+        if c == idx_main:
+            clean_mask[labels_cc == c] = 255
+            continue
+
+        if area < max(4, int(0.03 * marea)):
+            continue
+
+        """ Odrzucamy fragmenty sąsiednich znaków z CRNN dotykające lewej/prawej krawędzi wycinka,
+            ale zachowujemy znaki diakrytyczne położone w pionowym pasie głównej litery. """
+        touches_side_border = (x <= 1) or (x + w >= img_w - 1)
+        horizontally_detached = (x + w < mx - 2) or (x > mx + mw + 2)
+        if touches_side_border and horizontally_detached:
+            continue
+
+        clean_mask[labels_cc == c] = 255
+
+    coords = cv.findNonZero(clean_mask)
+    if coords is None:
+        return cv.resize(img_uint8, (64, 64), interpolation=cv.INTER_AREA)
+
+    bx, by, bw, bh = cv.boundingRect(coords)
+    if bw <= 1 or bh <= 1:
+        return cv.resize(img_uint8, (64, 64), interpolation=cv.INTER_AREA)
+
+    # Przycięcie skrajnych zbitek poziomych przy zachowaniu szerokich liter ('W', 'M', 'w', 'm')
+    if (bw / float(bh)) > 1.65:
+        target_w = int(bh * 1.5)
+        center_x = bx + bw // 2
+        bx = max(0, center_x - target_w // 2)
+        bw = min(img_w - bx, target_w)
+
+    masked_img = np.where(clean_mask > 0, img_uint8, 0).astype(np.uint8)
+    char_roi = masked_img[by:by + bh, bx:bx + bw]
+    canvas = np.zeros((64, 64), dtype=np.uint8)
+
+    small_chars = {'.', ',', "'", '-', ':', ';', 'i', 'l', 'I', '1'}
+    scale = 48.0 / max(bh, bw, 1)
+    if (char_hint in small_chars) or (char_hint is None and max(bw, bh) <= 18):
+        scale = min(scale, 1.5)
+
+    nw = min(64, max(1, int(bw * scale)))
+    nh = min(64, max(1, int(bh * scale)))
+
+    interp = cv.INTER_AREA if scale < 1.0 else cv.INTER_CUBIC
+    resized = cv.resize(char_roi, (nw, nh), interpolation=interp)
+
+    M = cv.moments(resized.astype(np.float32))
+    if M["m00"] > 0:
+        cx = int(M["m10"] / M["m00"])
+        cy = int(M["m01"] / M["m00"])
+    else:
+        cx, cy = nw // 2, nh // 2
+
+    y_off = 32 - cy
+    x_off = 32 - cx
+
+    y_start = max(0, y_off)
+    y_end = min(64, y_off + nh)
+    x_start = max(0, x_off)
+    x_end = min(64, x_off + nw)
+
+    crop_y_start = max(0, -y_off)
+    crop_y_end = crop_y_start + (y_end - y_start)
+    crop_x_start = max(0, -x_off)
+    crop_x_end = crop_x_start + (x_end - x_start)
+
+    canvas[y_start:y_end, x_start:x_end] = resized[crop_y_start:crop_y_end, crop_x_start:crop_x_end]
+    return canvas
+
+
 def val_process_fn(image: np.ndarray, **kwargs) -> np.ndarray:
-    """ Wrapper wywołujący logikę preprocessingu (deskewing/centering). """
-    return Preprocessing.process_for_crnn(np.asarray(image, dtype=np.uint8), target_h=64)
+    """ Wrapper wywołujący logikę preprocessingu i wymuszający geometrię 64x64 zgodną z treningiem CapsNet. """
+    processed = Preprocessing.process_for_crnn(np.asarray(image, dtype=np.uint8), target_h=64)
+    return _clean_and_center_crop(processed, char_hint=None)
 
 VAL_TRANSFORMS = v2.Compose([
     v2.ToImage(),
@@ -474,9 +584,8 @@ class CharLabelEncoder:
         return len(self.char_list)
 
 
-def save_debug_snapshots(model, loader, device, encoder, epoch):
-    """ Pobiera jedną paczkę danych walidacyjnych i generuje siatkę wizualizacji predykcji. Tytuły nad kafelkami
-        porównują predykcję z wartością rzeczywistą, oznaczając poprawne rozpoznania na zielono, a błędy na czerwono. """
+def save_debug_snapshots(model, loader, device, encoder, epoch, prefix="epoch"):
+    """ Pobiera jedną paczkę danych walidacyjnych i generuje siatkę wizualizacji predykcji. """
     model.eval()
     try:
         images, labels, zones, geoms, *rest = next(iter(loader))
@@ -488,11 +597,13 @@ def save_debug_snapshots(model, loader, device, encoder, epoch):
             _, preds = torch.max(probs, 1)
 
         num_imgs = min(len(images), 16)
-        fig, axes = plt.subplots(4, 4, figsize=(10, 10))
+        _, axes = plt.subplots(4, 4, figsize=(10, 10))
         mean, std = EMNIST_NORM_MEAN, EMNIST_NORM_STD
 
         for i, ax in enumerate(axes.flatten()):
-            if i >= num_imgs: break
+            if i >= num_imgs:
+                ax.axis('off')
+                continue
             img = images[i].cpu().squeeze().numpy()
             img = (img * std[0]) + mean[0]
             img = np.clip(img, 0, 1)
@@ -503,10 +614,14 @@ def save_debug_snapshots(model, loader, device, encoder, epoch):
             ax.set_title(f"P:{p} T:{t}", color=color, fontweight='bold', fontsize=8)
             ax.axis('off')
         plt.tight_layout()
-        plt.savefig(os.path.join(DEBUG_DIR, f"epoch_{epoch}_snapshot.png"))
+        plt.savefig(os.path.join(DEBUG_DIR, f"{prefix}_{epoch}_snapshot.png"))
         plt.close()
+    except StopIteration:
+        print(f"Błąd przy tworzeniu snapshota ({prefix}): brak danych w loaderze.")
+    except FileNotFoundError as e:
+        print(f"Błąd przy tworzeniu snapshota ({prefix}): {e}. Upewnij się, że folder {DEBUG_DIR} istnieje.")
     except Exception as e:
-        print(f"Błąd przy tworzeniu snapshota: {e}")
+        print(f"Błąd przy tworzeniu snapshota ({prefix}): {e}")
 
 
 def visual_test(model, loader, device, encoder, num_images=15):
@@ -569,7 +684,8 @@ def visual_test(model, loader, device, encoder, num_images=15):
         plt.axis('off')
 
     plt.tight_layout()
-    plt.show()
+    plt.savefig(os.path.join(DEBUG_DIR, "visual_test_final.png"), dpi=150)
+    plt.close()
 
 
 class HardCharsDataset(Dataset):
@@ -580,26 +696,36 @@ class HardCharsDataset(Dataset):
         self.transform = transform
         self.samples = []
 
+        # Weryfikacja istnienia katalogu
         if not os.path.exists(root_dir):
             print(f"[{now()}] Ścieżka {root_dir} nie istnieje.")
             return
 
+        # Wczytywanie próbek z katalogu, z uwzględnieniem podkatalogów dla znaków i typów przypadków
         with os.scandir(root_dir) as it_root:
             for entry in it_root:
-                if not entry.is_dir(): continue
+                if not entry.is_dir():
+                    continue
                 char_folder = entry.name
 
                 label_idx = self.encoder.char_to_idx.get(char_folder)
+                if label_idx is None and char_folder.endswith("_cap"):
+                    label_idx = self.encoder.char_to_idx.get(char_folder[:-4])
+                if label_idx is None and char_folder.startswith("sym_"):
+                    try:
+                        sym_char = chr(int(char_folder.split("_", 1)[1]))
+                        label_idx = self.encoder.char_to_idx.get(sym_char)
+                    except (ValueError, IndexError):
+                        label_idx = None
+
                 if label_idx is None:
-                    base_name = char_folder.replace("_cap", "")
-                    label_idx = self.encoder.char_to_idx.get(base_name)
-                
-                if label_idx is None: 
                     continue
 
                 target_path = os.path.join(entry.path, case_type)
-                if not os.path.isdir(target_path): continue
+                if not os.path.isdir(target_path):
+                    continue
 
+                # Obsługa plików obrazów i odpowiadających im plików .npz
                 with os.scandir(target_path) as it_target:
                     for f_entry in it_target:
                         if f_entry.name.lower().endswith(('.png', '.jpg')):
@@ -615,99 +741,68 @@ class HardCharsDataset(Dataset):
         return len(self.samples)
 
     def __getitem__(self, idx):
+        num_samples = len(self.samples)
         img_path, npy_path, label = self.samples[idx]
-        num_classes = len(self.encoder.char_to_idx)
-
         img = cv.imread(img_path, cv.IMREAD_GRAYSCALE)
+
+        # Pomijamy uszkodzone pliki zamiast zwracać etykietę -1 (która zawijałaby się na ostatnią klasę)
+        if img is None:
+            for offset in range(1, num_samples):
+                alt_idx = (idx + offset) % num_samples
+                img_path, npy_path, label = self.samples[alt_idx]
+                img = cv.imread(img_path, cv.IMREAD_GRAYSCALE)
+                if img is not None:
+                    break
+
+        num_classes = len(self.encoder.char_to_idx)
         if img is None:
             return (
                 torch.zeros((1, 64, 64), dtype=torch.float32),
-                torch.tensor(-1, dtype=torch.long),
+                torch.tensor(0, dtype=torch.long),
                 torch.tensor(1, dtype=torch.long),
                 torch.zeros(7, dtype=torch.float32),
                 torch.zeros(1024, dtype=torch.float32),
                 torch.tensor(0.0, dtype=torch.float32),
                 torch.zeros(num_classes, dtype=torch.float32),
-                torch.tensor(0, dtype=torch.long)
+                torch.tensor(0, dtype=torch.long),
             )
-        
-        img_float = img.astype(np.float32) / 255.0
-        if np.mean(img_float) > 0.5:
-            img_float = 1.0 - img_float
 
-        # Wczytujemy metadane z pliku .npz wyeksportowanego przez CRNN
+        char_str = self.encoder.decode(label)
+
+        # Czyszczenie fragmentów sąsiednich liter na krawędziach i centrowanie COM na 64x64
+        canvas_uint8 = _clean_and_center_crop(img, char_hint=char_str)
+        img_float = canvas_uint8.astype(np.float32) / 255.0
+
         try:
             data = np.load(npy_path, allow_pickle=True)
-            if hasattr(data, 'item'):
-                data_dict = data.item()
-            else:
-                data_dict = dict(data)
+            data_dict = data.item() if hasattr(data, "item") else dict(data)
         except Exception:
             data_dict = {}
-            
-        context_vec = torch.tensor(data_dict.get('context_vector', np.zeros(1024)), dtype=torch.float32)
-        
-        crnn_probs_raw = data_dict.get('crnn_probs', np.zeros(num_classes))
-        if len(crnn_probs_raw) != num_classes:
-            padded_probs = np.zeros(num_classes, dtype=torch.float32)
-            min_len = min(len(crnn_probs_raw), num_classes)
-            padded_probs[:min_len] = crnn_probs_raw[:min_len]
-            crnn_probs = torch.tensor(padded_probs, dtype=torch.float32)
+
+        raw_ctx = np.asarray(
+            data_dict.get("context_vector", np.zeros(1024)), dtype=np.float32
+        ).reshape(-1)
+        if raw_ctx.shape[0] != 1024:
+            padded_ctx = np.zeros(1024, dtype=np.float32)
+            min_ctx = min(raw_ctx.shape[0], 1024)
+            padded_ctx[:min_ctx] = raw_ctx[:min_ctx]
+            context_vec = torch.from_numpy(padded_ctx)
         else:
-            crnn_probs = torch.tensor(crnn_probs_raw, dtype=torch.float32)
+            context_vec = torch.from_numpy(raw_ctx.copy())
 
-        # Wycinanie z zachowaniem proporcji na podstawie COM
-        ink_mask = (img_float * 255).astype(np.uint8)
-        _, thresh = cv.threshold(ink_mask, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU)
-        coords = cv.findNonZero(thresh)
-        
-        if coords is not None:
-            bx, by, bw, bh = cv.boundingRect(coords)
-            if bw > 2 and bh > 2:
-                aspect_ratio = bw / float(bh)
-                if aspect_ratio > 1.4:
-                    target_w = int(bh * 1.3)
-                    center_x = bx + bw // 2
-                    bx = max(0, center_x - target_w // 2)
-                    bw = min(img_float.shape[1] - bx, target_w)
-
-                char_roi = img_float[by:by+bh, bx:bx+bw]
-                
-                canvas = np.zeros((64, 64), dtype=np.float32)
-                
-                scale = 48.0 / max(bh, bw, 1)
-                nw, nh = max(1, int(bw * scale)), max(1, int(bh * scale))
-                
-                nw, nh = min(nw, 64), min(nh, 64)
-                
-                interp = cv.INTER_AREA if scale < 1.0 else cv.INTER_CUBIC
-                resized = cv.resize(char_roi, (nw, nh), interpolation=interp)
-                
-                M = cv.moments(resized)
-                if M["m00"] > 0:
-                    cx = int(M["m10"] / M["m00"])
-                    cy = int(M["m01"] / M["m00"])
-                else:
-                    cx, cy = nw // 2, nh // 2
-                    
-                y_off = 32 - cy
-                x_off = 32 - cx
-                
-                y_start = max(0, y_off)
-                y_end = min(64, y_off + nh)
-                x_start = max(0, x_off)
-                x_end = min(64, x_off + nw)
-                
-                crop_y_start = max(0, -y_off)
-                crop_y_end = crop_y_start + (y_end - y_start)
-                crop_x_start = max(0, -x_off)
-                crop_x_end = crop_x_start + (x_end - x_start)
-                
-                canvas[y_start:y_end, x_start:x_end] = resized[crop_y_start:crop_y_end, crop_x_start:crop_x_end]
-                img_float = canvas
+        crnn_probs_raw = np.asarray(
+            data_dict.get("crnn_probs", np.zeros(num_classes)), dtype=np.float32
+        ).reshape(-1)
+        if crnn_probs_raw.shape[0] != num_classes:
+            padded_probs = np.zeros(num_classes, dtype=np.float32)
+            min_len = min(crnn_probs_raw.shape[0], num_classes)
+            padded_probs[:min_len] = crnn_probs_raw[:min_len]
+            crnn_probs = torch.from_numpy(padded_probs)
+        else:
+            crnn_probs = torch.from_numpy(crnn_probs_raw.copy())
 
         if self.transform:
-            img_pil = Image.fromarray((img_float * 255).astype(np.uint8), mode='L')
+            img_pil = Image.fromarray(canvas_uint8, mode="L")
             img_tensor = self.transform(img_pil)
         else:
             img_tensor = torch.from_numpy(img_float).unsqueeze(0)
@@ -718,12 +813,12 @@ class HardCharsDataset(Dataset):
         return (
             img_tensor,
             torch.tensor(label, dtype=torch.long),
-            torch.tensor(1, dtype=torch.long), 
-            torch.zeros(7, dtype=torch.float32), 
+            torch.tensor(1, dtype=torch.long),
+            torch.zeros(7, dtype=torch.float32),
             context_vec,
             source_quality_weight,
             crnn_probs,
-            torch.tensor(lang_id, dtype=torch.long)
+            torch.tensor(lang_id, dtype=torch.long),
         )
     
 
@@ -985,9 +1080,12 @@ class FastMorphologyFilter(nn.Module):
 
         # Lekkie wygładzenie krawędzi
         smoothed = func.avg_pool2d(dilated, kernel_size=3, stride=1, padding=1)
+        out = x * 0.7 + smoothed * 0.3
 
-        # 70% oryginału + 30% domkniętych luk
-        return torch.clamp(x * 0.7 + smoothed * 0.3, 0, 1)
+        # Przekazanie wartości wyjściowych w zakresie oryginalnego wejścia, aby nie wprowadzać artefaktów
+        x_min = x.amin(dim=(1, 2, 3), keepdim=True)
+        x_max = x.amax(dim=(1, 2, 3), keepdim=True)
+        return torch.clamp(out, min=x_min, max=x_max)
 
 
 class AffineSTN(nn.Module):
@@ -1032,7 +1130,7 @@ class AffineSTN(nn.Module):
 class CapsNet(nn.Module):
     """ Implementacja Capsule Network dedykowana do rozpoznawania trudnych/niejednoznacznych znaków.
         Wzbogacona o dedykowaną głowicę oceniającą pewność predykcji dla modelu językowego. """
-    def  __init__(self, num_classes=89, context_dim=1024):
+    def  __init__(self, num_classes=94, context_dim=1024):
         super().__init__()
         self.num_classes = num_classes
 
@@ -1095,22 +1193,28 @@ class CapsNet(nn.Module):
             nn.Sigmoid()
         )
 
+    def set_dropout_state(self, active: bool):
+        """ Włącza lub wyłącza wszystkie warstwy Dropout w sieci bez zmiany trybu model.train()/eval().
+            Przydatne do wymuszenia MC Dropout w inferencji lub wyłączenia go w treningu. """
+        self.dropout_active = active
+        for m in self.modules():
+            if isinstance(m, (nn.Dropout, nn.Dropout2d, nn.Dropout3d)):
+                if not hasattr(m, "_base_p"):
+                    m._base_p = m.p
+                m.p = m._base_p if active else 0.0
+
     def forward(self, x, y=None, word_context=None, confidence=None, crnn_probs=None, boundaries=None,
                 num_iterations=3, force_dropout=False, lang_id=None) -> dict:
-        batch_size = x.size(0)
-
-        if force_dropout:
-            self.train()
-        else:
-            self.eval()
-
+        # Rekonstrukcja ciągłości pociągnięć atramentu i wyrównanie geometryczne STN
         x_restored = self.gvf_restoration(x)
         x_aligned = self.stn(x_restored)
         features = self.backbone(x_aligned)
-        
+
+        # Ekstrakcja PrimaryCaps
         u = self.primary(features)
         batch_size = u.size(0)
 
+        # Grupowana projekcja macierzowa i routing oparty na mechanizmie uwagi
         u_grouped = u.view(batch_size, self.num_groups, self.caps_per_group, 1, -1, 1)
         u_hat = torch.matmul(self.W, u_grouped).squeeze(-1)
         u_hat_reshaped = u_hat.view(batch_size * self.num_groups, self.caps_per_group, self.num_classes, 32)
@@ -1120,34 +1224,43 @@ class CapsNet(nn.Module):
         v_j_unflattened = v_j_grouped.view(batch_size, self.num_groups, self.num_classes, 32)
         s_final = v_j_unflattened.sum(dim=1)
 
+        """ Nakładamy bezstanowy MC Dropout bez trwałej mutacji stanu modułów w trybie eval(),
+            żeby uodpornić model na błędy wycięcia, częste w inferencji (nie używamy m.train()). """
+        if force_dropout:
+            s_final = func.dropout(s_final, p=self.dropout.p, training=True)
+
+        # Nieliniowość Squash, żeby długość wektora kapsułki realnie reprezentowała pewność predykcji
         norm_squared = (s_final ** 2).sum(dim=-1, keepdim=True)
         scale = norm_squared / (1 + norm_squared)
         v_j = scale * s_final / torch.sqrt(norm_squared + 1e-9)
 
         classes_norms = torch.sqrt((v_j ** 2).sum(dim=-1) + 1e-9)
-
-        # Jeśli Agent dostarczył wstępne prawdopodobieństwa z CRNN, wspieramy nimi decyzję CapsNetu
-        if crnn_probs is not None:
-            if crnn_probs.shape == classes_norms.shape:
-                # 85% geometria CapsNet + 15% kontekst sekwencyjny CRNN
-                classes_norms = 0.85 * classes_norms + 0.15 * crnn_probs.clamp(0.0, 1.0)
-
         probs = classes_norms.clamp(0.0, 1.0)
         entropy = -torch.sum(probs * torch.log(probs + 1e-10), dim=-1)
 
-        if y is None:
-            y_indices = classes_norms.argmax(dim=-1)
-        else:
-            y_indices = y
+        # Wybór kapsułek do dekodowania i oceny pewności
+        pred_indices = classes_norms.argmax(dim=-1)
+        y_indices = pred_indices if y is None else y
 
-        masked_v = v_j[torch.arange(batch_size), y_indices]
-        
-        stochastic_v = self.dropout(masked_v)
+        batch_arange = torch.arange(batch_size, device=v_j.device)
+
+        """ W treningu Dropout jest aktywny dopiero od 2. epoki (dropout_active=True),
+            natomiast w inferencji może zostać wymuszony przez MC Dropout (force_dropout=True) """
+        apply_dropout = (self.training and getattr(self, "dropout_active", True)) or force_dropout
+
+        # Dekoder rekonstrukcyjny oraz głowice stref i geometrii korzystają z etykiety (w treningu) lub argmax (w inferencji)
+        masked_v = v_j[batch_arange, y_indices]
+        stochastic_v = func.dropout(masked_v, p=self.dropout.p, training=apply_dropout)
+
+        """ Głowica pewności (certainty_head) zawsze ocenia wektor kapsułki zwycięskiej, dzięki czemu
+            rozkład wejściowy jest identyczny w treningu i inferencji (brak zawyżania pewności przy pomyłkach). """
+        pred_v = v_j[batch_arange, pred_indices]
+        certainty_in = func.dropout(pred_v, p=self.dropout.p, training=apply_dropout)
 
         reconstruction = self.decoder(stochastic_v)
         z_logits = self.zone_head(stochastic_v)
         g_stats = self.geom_head(stochastic_v)
-        certainty = self.certainty_head(stochastic_v)
+        certainty = self.certainty_head(certainty_in)
 
         return {
             "norms": classes_norms,
@@ -1178,28 +1291,31 @@ class CapsNet(nn.Module):
         device = image_tensor.device
 
         B, C, H, W = image_tensor.shape
-        n_players = grid_size * grid_size[1]
-        patch_h = H // grid_size
+        patch_h = H // grid_size[0]
         patch_w = W // grid_size[1]
 
         def model_predict_wrapper(masks: np.ndarray) -> np.ndarray:
-            num_coalitions = masks.shape
-            scores = list()
+            """ Funkcja pomocnicza do predykcji modelu na zestawie masek. Przyjmuje maski w formacie binarnym i zwraca normy kapsułek
+                dla docelowej klasy. Używana w algorytmie SHAPiQ do oceny wpływu poszczególnych masek na predykcję modelu. """
+            num_coalitions = masks.shape[0]
+            scores = []
 
             with torch.no_grad():
                 batch_size = 32
                 for i in range(0, num_coalitions, batch_size):
                     mask_batch = masks[i:i + batch_size]
-                    current_bs = mask_batch.shape
+                    current_bs = mask_batch.shape[0]
 
                     masked_imgs = torch.zeros(current_bs, C, H, W, device=device)
 
                     for b in range(current_bs):
-                        for row in range(grid_size):
+                        for row in range(grid_size[0]):
                             for col in range(grid_size[1]):
                                 player_idx = row * grid_size[1] + col
                                 if mask_batch[b, player_idx] == 1:
-                                    masked_imgs[b, :, row * patch_h:(row + 1) * patch_h, col * patch_w:(col + 1) * patch_w] = image_tensor[0, :, row * patch_h:(row + 1) * patch_h, col * patch_w:(col + 1) * patch_w]
+                                    masked_imgs[b, :, row * patch_h:(row + 1) * patch_h, col * patch_w:(col + 1) * patch_w] = (
+                                        image_tensor[0, :, row * patch_h:(row + 1) * patch_h, col * patch_w:(col + 1) * patch_w]
+                                    )
 
                     outputs = self.forward(masked_imgs)
                     norms = outputs["norms"] if isinstance(outputs, dict) else outputs
@@ -1208,29 +1324,46 @@ class CapsNet(nn.Module):
 
             return np.array(scores)
 
-    def predict_char(self, crop_tensor, encoder, word_context=None, confidence=None, boundaries=None, crnn_probs=None, mc_samples=6):
+        return model_predict_wrapper
+
+    def predict_char(self, crop_tensor, encoder, word_context=None, confidence=None, boundaries=None, crnn_probs=None, mc_samples=8):
         """ Metoda inferencyjna z TTA (Test-Time Augmentation). 
-            Generuje warianty geometryczne wycinka (np. mikro-przesunięcia), przechodzi przez sieć,
+            Generuje warianty geometryczne wycinka (przesunięcia poziome i lekkie zwężenie), przechodzi przez sieć,
             a następnie uśrednia surowe wektory kapsułek (v_j) zamiast gotowych prawdopodobieństw. 
-            Dzięki temu model uodparnia się na błędy wycięcia (croppingu). """
+            Dzięki temu model uodparnia się na błędy wycięcia (croppingu) z CRNN. """
         self.eval()
+        if crop_tensor.dim() == 3:
+            crop_tensor = crop_tensor.unsqueeze(0)
+
+        std_val = float(EMNIST_NORM_STD[0]) if isinstance(EMNIST_NORM_STD, (list, torch.Tensor)) else float(EMNIST_NORM_STD)
+        mean_val = float(EMNIST_NORM_MEAN[0]) if isinstance(EMNIST_NORM_MEAN, (list, torch.Tensor)) else float(EMNIST_NORM_MEAN)
+
+        # Wartość czarnego tła w przestrzeni po normalizacji (zamiast 0.0, które daje jasnoszarą ramkę)
+        bg_val = -mean_val / (std_val + 1e-9)
+
         all_capsules = []
         all_certainties = []
         all_recon_errors = []
 
-        # Definicja prostych, bezstratnych wariantów TTA w locie dla uodpornienia na przesunięcia w wycinku
+        # Definicja prostych, bezstratnych wariantów TTA w locie dla uodpornienia na przesunięcia granic CTC w wycinku
         b, c, h, w = crop_tensor.shape
         tta_views = [crop_tensor]
-        
-        # Widok 1: Lekkie przesunięcie w prawo-dół
-        pad1 = torch.nn.functional.pad(crop_tensor[:, :, :-1, :-1], (1, 0, 1, 0), mode='constant', value=0.0)
-        pad1 = torch.nn.functional.interpolate(pad1, size=(h, w), mode='bilinear', align_corners=False)
-        tta_views.append(pad1)
-        
-        # Widok 2: Lekkie przesunięcie w lewo-góra
-        pad2 = torch.nn.functional.pad(crop_tensor[:, :, 1:, 1:], (0, 1, 0, 1), mode='constant', value=0.0)
-        pad2 = torch.nn.functional.interpolate(pad2, size=(h, w), mode='bilinear', align_corners=False)
-        tta_views.append(pad2)
+
+        # Widok 1: Przesunięcie w prawo o 3 px (kompensacja przesunięcia ramki CTC w lewo)
+        shift_right = torch.nn.functional.pad(crop_tensor[:, :, :, :-3], (3, 0, 0, 0), mode='constant', value=bg_val)
+        tta_views.append(shift_right)
+
+        # Widok 2: Przesunięcie w lewo o 3 px (kompensacja przesunięcia ramki CTC w prawo)
+        shift_left = torch.nn.functional.pad(crop_tensor[:, :, :, 3:], (0, 3, 0, 0), mode='constant', value=bg_val)
+        tta_views.append(shift_left)
+
+        # Widok 3: Lekkie zwężenie poziome do 90% szerokości (kompensacja zbyt szerokich wycinków CTC)
+        narrow_w = max(4, int(w * 0.9))
+        pad_l = (w - narrow_w) // 2
+        pad_r = w - narrow_w - pad_l
+        squeezed = torch.nn.functional.interpolate(crop_tensor, size=(h, narrow_w), mode='bilinear', align_corners=False)
+        squeezed = torch.nn.functional.pad(squeezed, (pad_l, pad_r, 0, 0), mode='constant', value=bg_val)
+        tta_views.append(squeezed)
 
         with torch.no_grad():
             for view in tta_views:
@@ -1238,44 +1371,46 @@ class CapsNet(nn.Module):
                 samples_per_view = max(1, mc_samples // len(tta_views))
                 for _ in range(samples_per_view):
                     outputs = self.forward(view, force_dropout=True)
-                    
-                    v_j = outputs["capsules"]       # Surowe wektory kapsułek [B, num_classes, 32]
+
+                    v_j = outputs["capsules"]
                     certainty = outputs["certainty"]
                     reconstruction = outputs["reconstruction"]
 
                     all_capsules.append(v_j)
                     all_certainties.append(certainty)
 
-                    # MSE rekonstrukcji jako wskaźnik wadliwego wycięcia
+                    # MSE rekonstrukcji jako wskaźnik wadliwego wycięcia (po sprowadzeniu wejścia do [0, 1])
                     t_target = torch.nn.functional.interpolate(view, size=(32, 32), mode='bilinear', align_corners=False)
-                    mse_error = torch.nn.functional.mse_loss(reconstruction, t_target).item()
+                    t_target_norm = ((t_target * std_val) + mean_val).clamp(0.0, 1.0)
+                    mse_error = torch.nn.functional.mse_loss(reconstruction, t_target_norm).item()
                     all_recon_errors.append(mse_error)
 
         """ Zamiast uśredniać gotowe prawdopodobieństwa, uśredniamy geometryczne wektory kapsułek.
             To uśrednia kierunki przestrzenne i uodparnia na rotację/przesunięcie w kadrze. """
-        avg_capsules = torch.stack(all_capsules).mean(dim=0) 
-        
+        avg_capsules = torch.stack(all_capsules).mean(dim=0)
+
         # Wyliczamy ostateczne normy z uśrednionego wektora przestrzennego
         if avg_capsules.dim() == 3:
-            avg_norms = torch.sqrt((avg_capsules ** 2).sum(dim=-1) + 1e-9).squeeze(0) # [num_classes]
+            avg_norms = torch.sqrt((avg_capsules ** 2).sum(dim=-1) + 1e-9).squeeze(0)  # [num_classes]
             winning_capsule_vector = avg_capsules[0, avg_norms.argmax(), :]
         else:
             avg_norms = torch.sqrt((avg_capsules ** 2).sum(dim=-1) + 1e-9)
             winning_capsule_vector = avg_capsules[avg_norms.argmax(), :]
 
-        avg_probs = torch.softmax(avg_norms, dim=-1)
+        # Normalizacja sumy norm zamiast softmax (unikamy sztucznego spłaszczenia na 93 klasach)
+        avg_probs = avg_norms / (avg_norms.sum(dim=-1, keepdim=True) + 1e-9)
         avg_certainty = torch.stack(all_certainties).mean().item()
         avg_recon_error = sum(all_recon_errors) / len(all_recon_errors)
-        
+
         # Wariancja epistemiczna z uśrednionych norm
         epistemic_variance = torch.stack([torch.norm(c, dim=-1) for c in all_capsules]).var(dim=0).mean().item()
 
-        top_probs, top_indices = torch.topk(avg_probs, 2, dim=-1)
+        top_norms, top_indices = torch.topk(avg_norms, 2, dim=-1)
         entropy = -torch.sum(avg_probs * torch.log(avg_probs + 1e-10))
 
         winning_idx = top_indices[0].item() if top_indices.dim() == 1 else top_indices[0, 0].item()
-        conf = top_probs[0].item() if top_probs.dim() == 1 else top_probs[0, 0].item()
-        margin = (top_probs[0] - top_probs[1]).item() if top_probs.numel() > 1 else 0.0
+        conf = top_norms[0].item() if top_norms.dim() == 1 else top_norms[0, 0].item()
+        margin = (top_norms[0] - top_norms[1]).item() if top_norms.numel() > 1 else 0.0
 
         return {
             'char': encoder.decode(winning_idx),
@@ -1284,50 +1419,9 @@ class CapsNet(nn.Module):
             'entropy': entropy.item() if isinstance(entropy, torch.Tensor) else entropy,
             'epistemic_unc': epistemic_variance,
             'capsnet_certainty': avg_certainty,
-            'reconstruction_error': avg_recon_error, 
+            'reconstruction_error': avg_recon_error,
             'capsule_embedding': winning_capsule_vector
         }
-    
-
-class CapsuleFusionDataset(torch.utils.data.Dataset):
-    """ Zestaw danych dla modułu Capsule Network w architekturze fuzji. Wczytuje wycięte obrazy znaków powiązane
-        z metadanymi wyeksportowanymi przez model CRNN, przygotowując je do ostatecznej weryfikacji geometrycznej. """
-    def __init__(self, root_dir, transform=None):
-        self.root_dir = root_dir
-        self.transform = transform
-        self.samples = []
-
-        # Pobieramy, ignorując 'dummy'
-        self.classes = sorted([d for d in os.listdir(root_dir) if os.path.isdir(os.path.join(root_dir, d)) and d != 'dummy'])
-        self.class_to_idx = {cls_name: i for i, cls_name in enumerate(self.classes)}
-
-        for target_class in self.classes:
-            class_path = os.path.join(root_dir, target_class)
-            # Szukamy tylko plików PNG
-            for f in os.listdir(class_path):
-                if f.endswith('.png'):
-                    img_path = os.path.join(class_path, f)
-                    # Zakładamy, że .npz ma tę samą nazwę co .png
-                    npy_path = img_path.replace('.png', '.npz')
-                    if os.path.exists(npy_path):
-                        self.samples.append((img_path, npy_path, self.class_to_idx[target_class]))
-
-    def __len__(self):
-        return len(self.samples)
-
-    def __getitem__(self, idx):
-        img_path, npy_path, label = self.samples[idx]
-
-        # Wczytujemy obraz
-        image = cv.imread(img_path, cv.IMREAD_GRAYSCALE)
-        if self.transform:
-            image = self.transform(image=image)['image'] if hasattr(self.transform, 'call') else self.transform(image)
-
-        # Wczytujemy kontekst (Deep Fusion)
-        metadata = np.load(npy_path, allow_pickle=True).item()
-        context_vec = torch.tensor(metadata['context'], dtype=torch.float32)
-
-        return image, context_vec, label
 
 
 def get_crnn_error_weights(char_true, char_pred, encoder, top_n=20):
@@ -1388,7 +1482,7 @@ class CapsNetDecoder(nn.Module):
     """ Dekoder rekonstrukcyjny dla sieci CapsNet. Odgrywa rolę regularyzatora wymuszającego na kapsułkach
         kodowanie wizualnych cech znaków, niezbędnych do odtworzenia oryginalnego obrazu. Do sieci w pełni
         połączonej przepuszczany jest wyłącznie wektor aktywnej kapsułki. """
-    def __init__(self, num_classes=89, capsule_dim=16, img_size=64):
+    def __init__(self, num_classes=94, capsule_dim=16, img_size=64):
         super().__init__()
         self.img_size = img_size
         self.num_classes = num_classes
@@ -1547,36 +1641,37 @@ class CapsNetLoss(nn.Module):
 
     def forward(self, images, labels, probs, reconstructions, g_stats, boundaries,
                 crnn_confidence=None, class_capsules=None, lambda_contrastive=0.0, certainty_preds=None, source_quality_weight=None):
-        batch_size = images.size(0)
         labels = labels.long()
 
         # Uncertantity-aware margin loss
         weighted_margin = self.uncertainty_margin(probs, labels, crnn_confidence=crnn_confidence, source_quality_weight=source_quality_weight)
 
-        # Reconstruction Loss (BCE + SSIM) z zabezpieczeniem przed NaN
-        target = torch.nn.functional.interpolate(images, size=(32, 32), mode='bilinear', align_corners=False)
+        # Wyłączamy autocast i wymuszamy float32, ponieważ F.binary_cross_entropy jest blokowane w float16 (RuntimeError)
+        with torch.amp.autocast("cuda", enabled=False):
+            # Reconstruction Loss (BCE + SSIM) z zabezpieczeniem przed NaN
+            target = torch.nn.functional.interpolate(images.float(), size=(32, 32), mode='bilinear', align_corners=False)
 
-        std_val = float(EMNIST_NORM_STD[0]) if isinstance(EMNIST_NORM_STD, (list, torch.Tensor)) else float(EMNIST_NORM_STD)
-        mean_val = float(EMNIST_NORM_MEAN[0]) if isinstance(EMNIST_NORM_MEAN, (list, torch.Tensor)) else float(EMNIST_NORM_MEAN)
+            std_val = float(EMNIST_NORM_STD[0]) if isinstance(EMNIST_NORM_STD, (list, torch.Tensor)) else float(EMNIST_NORM_STD)
+            mean_val = float(EMNIST_NORM_MEAN[0]) if isinstance(EMNIST_NORM_MEAN, (list, torch.Tensor)) else float(EMNIST_NORM_MEAN)
 
-        t_norm = (target * std_val) + mean_val
-        t_norm = t_norm.clamp(0, 1)
+            t_norm = (target * std_val) + mean_val
+            t_norm = t_norm.clamp(0, 1)
 
-        # Binary Cross Entropy wywala NaN przy 0 lub 1 logarytmu, dlatego dodajemy margines
-        epsilon = 1e-7
-        r_norm = reconstructions.clamp(epsilon, 1.0 - epsilon)
-        
-        # Liczymy błędy na wspólnej skali
-        bce_l = torch.nn.functional.binary_cross_entropy(r_norm, t_norm)
-        ssim_l = self.ssim(r_norm, t_norm)
+            # Binary Cross Entropy wywala NaN przy 0 lub 1 logarytmu, dlatego dodajemy margines
+            epsilon = 1e-7
+            r_norm = reconstructions.float().clamp(epsilon, 1.0 - epsilon)
+            
+            # Liczymy błędy na wspólnej skali
+            bce_l = torch.nn.functional.binary_cross_entropy(r_norm, t_norm)
+            ssim_l = self.ssim(r_norm, t_norm)
 
-        recon_total = 0.7 * bce_l + 0.3 * ssim_l
+            recon_total = 0.7 * bce_l + 0.3 * ssim_l
 
         # Dodatkowe zabezpieczenie: jeśli total_loss jest NaN (np. z MarginLoss), przytnij go
         total_loss = weighted_margin + self.reconstruction_weight * recon_total
         
         if torch.isnan(total_loss).any():
-            # Zamiast pozwolić na propagację NaN, zastępujemy je zere
+            # Zamiast pozwolić na propagację NaN, zastępujemy je zerem
             total_loss = torch.nan_to_num(total_loss, nan=0.0, posinf=0.0, neginf=0.0)
 
         if certainty_preds is not None:
@@ -1585,10 +1680,12 @@ class CapsNetLoss(nn.Module):
                 
                 # 1.0 jeśli CapsNet trafił poprawnie, 0.0 jeśli to pomyłka / fragment / zbitka
                 correctness = (predicted_classes == labels).float().unsqueeze(1)
-            certainty_loss = torch.nn.functional.binary_cross_entropy(certainty_preds, correctness)
+            with torch.amp.autocast("cuda", enabled=False):
+                cert_clamped = certainty_preds.float().clamp(epsilon, 1.0 - epsilon)
+                certainty_loss = torch.nn.functional.binary_cross_entropy(cert_clamped, correctness)
             total_loss = total_loss + 0.5 * certainty_loss
 
-        # Contrastive capsule loss -
+        # Contrastive capsule loss
         if lambda_contrastive > 0 and class_capsules is not None:
             contrastive_loss = self.contrastive_caps(class_capsules, labels)
             total_loss = total_loss + lambda_contrastive * contrastive_loss
@@ -1812,24 +1909,64 @@ def setup_optimizer_and_scheduler(model, train_loader, epochs, max_lr=1e-3):
     return optimizer, scheduler
 
 
-def train_and_save(model, train_loader, val_loader, num_classes, device, epochs_to_run, save_path, zone_map, crnn_weights, num_iterations, lr, phase_name="main", checkpoint_dict=None):
+def train_and_save(
+    model,
+    train_loader,
+    val_loader,
+    num_classes,
+    device,
+    epochs_to_run,
+    save_path,
+    zone_map,
+    crnn_weights,
+    num_iterations,
+    lr,
+    phase_name="main",
+    checkpoint_dict=None,
+):
     """ Realizuje wieloetapowy proces uczenia i adaptacji modelu CapsNet w kaskadowym potoku HTR. """
-    if not hasattr(train_and_save, 'loader_pure_val'): train_and_save.loader_pure_val = None
-    if not hasattr(train_and_save, 'loader_hard_val'): train_and_save.loader_hard_val = None
+    if not hasattr(train_and_save, "loader_pure_val"):
+        train_and_save.loader_pure_val = None
+    if not hasattr(train_and_save, "loader_hard_val"):
+        train_and_save.loader_hard_val = None
 
     start_epoch = 0
     patience_counter = 0
     max_patience = 3
-    best_val_cer = 1.0
-    best_loss = float('inf')
+    best_val_cer = (
+        checkpoint_dict.get("best_val_cer", 1.0)
+        if checkpoint_dict and checkpoint_dict.get("phase") == phase_name
+        else 1.0
+    )
+    best_loss = (
+        checkpoint_dict.get("best_loss", float("inf"))
+        if checkpoint_dict and checkpoint_dict.get("phase") == phase_name
+        else float("inf")
+    )
 
     encoder = CharLabelEncoder()
 
-    # Inicjalizacja strat
+    zone_lookup = None
+    if zone_map is not None:
+        zone_lookup = torch.tensor(
+            [zone_map.get(i, 1) for i in range(num_classes)],
+            device=device,
+            dtype=torch.long,
+        )
+
+    """ Inicjalizacja strat, w fazie MAIN używamy UncertaintyAwareMarginLoss, żeby uwzględnić niepewność w predykcjach,
+        a w fazie HARD_MINING CapsNetLoss, żeby uwzględnić rekonstrukcję i kontrastowe straty. """
     if phase_name == "MAIN":
-        criterion_char = UncertaintyAwareMarginLoss(num_classes=num_classes, device=device, smoothing=SMOOTHING).to(device)
+        criterion_char = UncertaintyAwareMarginLoss(
+            num_classes=num_classes, device=device, smoothing=SMOOTHING
+        ).to(device)
     else:
-        criterion_char = CapsNetLoss(num_classes=num_classes, device=device, crnn_weights=crnn_weights, smoothing=SMOOTHING).to(device)
+        criterion_char = CapsNetLoss(
+            num_classes=num_classes,
+            device=device,
+            crnn_weights=crnn_weights,
+            smoothing=SMOOTHING,
+        ).to(device)
 
     criterion_zone = nn.CrossEntropyLoss().to(device)
 
@@ -1840,47 +1977,54 @@ def train_and_save(model, train_loader, val_loader, num_classes, device, epochs_
         model.unfreeze_backbone()
 
     # Optymalizator zbiera tylko te parametry, które mają requires_grad = True
-    params = [p for p in model.parameters() if p.requires_grad] + list(criterion_char.parameters())
+    params = [p for p in model.parameters() if p.requires_grad] + list(
+        criterion_char.parameters()
+    )
     optimizer = torch.optim.Adam(params, lr=lr, weight_decay=WEIGHT_DECAY)
 
     # Synchronizacja Schedulera z aktualizacjami wag
     steps_per_epoch = min(len(train_loader), STEPS_PER_EPOCH)
-    updates_per_epoch = steps_per_epoch // ACCUMULATION_STEPS
+    updates_per_epoch = max(1, steps_per_epoch // ACCUMULATION_STEPS)
     total_updates = epochs_to_run * updates_per_epoch
 
     # Warmup do 30% całego treningu, model na spokojnie szuka odpowiedniej drogi
     warmup_steps = max(10, int(0.3 * total_updates))
     decay_steps = max(1, total_updates - warmup_steps)
 
-    warmup_sch = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup_steps)
-    cosine_sch = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=decay_steps, eta_min=1e-7)
-    scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, schedulers=[warmup_sch, cosine_sch], milestones=[warmup_steps])
+    warmup_sch = torch.optim.lr_scheduler.LinearLR(
+        optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup_steps
+    )
+    cosine_sch = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=decay_steps, eta_min=1e-7
+    )
+    scheduler = torch.optim.lr_scheduler.SequentialLR(
+        optimizer, schedulers=[warmup_sch, cosine_sch], milestones=[warmup_steps]
+    )
 
     # Wczytywanie stanu
     start_epoch = 0
-    if checkpoint_dict and checkpoint_dict.get('phase') == phase_name:
+    if checkpoint_dict and checkpoint_dict.get("phase") == phase_name:
         try:
-            optimizer.load_state_dict(checkpoint_dict['optimizer_state'])
-            start_epoch = checkpoint_dict.get('epoch', -1) + 1
+            optimizer.load_state_dict(checkpoint_dict["optimizer_state"])
+            start_epoch = checkpoint_dict.get("epoch", -1) + 1
 
             # Przesuwamy scheduler do odpowiedniego miejsca
             for _ in range(start_epoch * updates_per_epoch):
                 scheduler.step()
         except (RuntimeError, KeyError, ValueError) as e:
-            # Przechwytujemy tylko błędy związane z niedopasowaniem wag lub brakiem kluczy
-            tqdm.write(f"[{now()}] Reset stanu optymalizatora/schedulera. Błąd: {e}")
+            tqdm.write(
+                f"[{now()}] Reset stanu optymalizatora/schedulera. Błąd: {e}"
+            )
             start_epoch = 0
 
     # Konfiguracja MLflow
     global HAS_MLFLOW
-    
+
     if HAS_MLFLOW:
         try:
             import os
-            # Wymuszenie zgody na używanie lokalnego folderu dla pewności w tym wątku
+
             os.environ["MLFLOW_ALLOW_FILE_STORE"] = "true"
-            
-            # Zamiast 127.0.0.1 kierujemy zapis prosto na dysk
             mlflow.set_tracking_uri("file:///app/output_data/mlruns")
             mlflow.set_experiment("CapsNet_Training_Phases")
             run_context = mlflow.start_run(run_name=f"Phase_{phase_name}")
@@ -1888,8 +2032,12 @@ def train_and_save(model, train_loader, val_loader, num_classes, device, epochs_
                 "phase": phase_name,
                 "epochs": epochs_to_run,
                 "batch_size": BATCH_SIZE,
-                "initial_lr": lr
+                "initial_lr": lr,
             })
+        except ImportError:
+            print("MLflow nie jest zainstalowany. Wyłączam logowanie, kontynuuję trening!")
+            HAS_MLFLOW = False
+            run_context = contextlib.nullcontext()
         except Exception as e:
             print(f"Błąd MLflow: {e}. Wyłączam logowanie, kontynuuję trening!")
             HAS_MLFLOW = False
@@ -1897,83 +2045,124 @@ def train_and_save(model, train_loader, val_loader, num_classes, device, epochs_
     else:
         run_context = contextlib.nullcontext()
 
-# Główny trening objęty menedżerem kontekstu
+    amp_dtype = (
+        torch.bfloat16
+        if torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+        else torch.float16
+    )
+
+    # Wyłączamy Dropout w fazie MAIN, dopóki nie osiągniemy 3. epoki lub nie uzyskamy wystarczającej jakości walidacji
+    dropout_unlocked = (
+        phase_name != "MAIN"
+        or start_epoch >= 2
+        or best_val_cer <= 0.15
+    )
+
     with run_context:
-        # Inicjalizacja Scalera dla Mieszanej Precyzji (AMP)
-        scaler = torch.amp.GradScaler('cuda')
+        scaler = torch.amp.GradScaler("cuda", enabled=(amp_dtype == torch.float16))
 
-        for epoch in range(start_epoch, epochs_to_run):
+        epoch_bar = epoch_progress_bar(
+            range(start_epoch, epochs_to_run),
+            total_epochs=epochs_to_run,
+            stage_name=f"CapsNet [{phase_name.upper()}]",
+            initial=start_epoch,
+        )
+
+        for epoch in epoch_bar:
+            epoch_bar.set_description_str(
+                f"CapsNet [{phase_name.upper()}] | Epoka {epoch + 1}/{epochs_to_run}"
+            )
             model.train()
-            running_loss = 0.0
-            loop = tqdm(train_loader, desc=f"[{phase_name.upper()}] Epoka {epoch + 1}", total=steps_per_epoch, ncols=120, leave=False, disable=False)
 
-            optimizer.zero_grad()  # Czyścimy na początku epoki
+            # Bezwarunkowa aktywacja najpóźniej od 3. epoki
+            if not dropout_unlocked and epoch >= 2:
+                dropout_unlocked = True
+                tqdm.write(f"[{now()}] Rozpoczęto 3. epokę MAIN — aktywacja Dropout.")
+            model.set_dropout_state(dropout_unlocked)
+
+            running_loss = 0.0
+            loop = tqdm(
+                train_loader,
+                desc=f"[{phase_name.upper()}] Epoka {epoch + 1}",
+                total=steps_per_epoch,
+                ncols=120,
+                leave=False,
+                disable=False,
+            )
+
+            optimizer.zero_grad()
 
             for i, batch in enumerate(loop):
-                if i >= steps_per_epoch: break
+                if i >= steps_per_epoch:
+                    break
 
-                batch_cuda = [b.to(device, non_blocking=True) if torch.is_tensor(b) else b for b in batch]
-                inputs, labels, zones, boundaries, context_vecs, confs, *rest = batch_cuda
+                batch_cuda = [
+                    b.to(device, non_blocking=True) if torch.is_tensor(b) else b
+                    for b in batch
+                ]
+                inputs, labels, zones, boundaries, context_vecs, confs, *rest = (
+                    batch_cuda
+                )
                 crnn_p = rest[0] if rest else None
 
-                # Używamy checkpointingu
+                if zone_lookup is not None:
+                    zones = zone_lookup[labels.long()]
+
                 def forward_pass(in_p, lbl_p, ctx_p, conf_p, crnn_p, bnd_p):
-
-                    # CapsNet forward zwraca słownik
-                    return model(in_p, lbl_p, word_context=ctx_p, confidence=conf_p, 
-                                 crnn_probs=crnn_p, boundaries=bnd_p)
-
-                in_cpy = inputs.detach().clone().requires_grad_(True) 
-
-                # Kontekst Mieszanej Precyzji
-                with torch.autocast(device_type='cuda', dtype=torch.float16):
-
-                    # outputs to słownik: {"norms": ..., "reconstruction": ..., "z_logits": ..., "g_stats": ...}
-                    outputs = torch.utils.checkpoint.checkpoint(
-                        forward_pass, 
-                        in_cpy, labels.detach().clone(), context_vecs.detach().clone(), 
-                        confs.detach().clone(), crnn_p.detach().clone() if crnn_p is not None else None, 
-                        boundaries.detach().clone(),
-                        use_reentrant=False
+                    return model(
+                        in_p,
+                        lbl_p,
+                        word_context=ctx_p,
+                        confidence=conf_p,
+                        crnn_probs=crnn_p,
+                        boundaries=bnd_p,
                     )
-                    
-                    # Pobranie probs
-                    probs = outputs["norms"] 
+
+                in_cpy = inputs.detach().clone().requires_grad_(True)
+
+                with torch.autocast(device_type="cuda", dtype=amp_dtype):
+                    outputs = torch.utils.checkpoint.checkpoint(
+                        forward_pass,
+                        in_cpy,
+                        labels.detach().clone(),
+                        context_vecs.detach().clone(),
+                        confs.detach().clone(),
+                        crnn_p.detach().clone() if crnn_p is not None else None,
+                        boundaries.detach().clone(),
+                        use_reentrant=False,
+                    )
+
+                    probs = outputs["norms"]
                     z_logits = outputs["z_logits"]
 
-                    # Definicja straty
                     if phase_name == "MAIN":
-                        char_loss = criterion_char(probs, labels, source_quality_weight=confs)
-                        contrastive_loss = 0.0 # W fazie MAIN skupiamy się na klasyfikacji
+                        char_loss = criterion_char(
+                            probs, labels, source_quality_weight=confs
+                        )
                     else:
                         recs = outputs["reconstruction"]
                         g_stats = outputs["g_stats"]
-
-                        # Zakładamy, że criterion_char zwraca krotkę lub obiekt z contrastive_loss
-                        char_loss, contrastive_loss = criterion_char(
-                            inputs, labels, probs.clone(), recs.clone(), 
-                            g_stats.clone(), boundaries.clone(), source_quality_weight=confs
+                        char_loss = criterion_char(
+                            inputs,
+                            labels,
+                            probs.clone(),
+                            recs.clone(),
+                            g_stats.clone(),
+                            boundaries.clone(),
+                            certainty_preds=outputs.get("certainty"),
+                            source_quality_weight=confs,
                         )
-                    
-                    """ Balansowanie składników straty
-                        1.0 * char_loss (kluczowe)
-                        0.1 * zone_loss (pomocnicze)
-                        0.05 * contrastive_loss (wymusza różnice między 't' a '7') """
+
                     zone_loss = criterion_zone(z_logits.clone(), zones.long())
-                    
-                    total_loss = (char_loss + 0.1 * zone_loss + 0.05 * contrastive_loss) 
+                    total_loss = char_loss + 0.1 * zone_loss
                     loss = total_loss / ACCUMULATION_STEPS
-                
-                # Propagacja wsteczna ze skalowaniem (AMP)
+
                 scaler.scale(loss).backward()
 
-                # Akumulacja gradientu
                 if (i + 1) % ACCUMULATION_STEPS == 0:
-                    # Przed przycięciem gradientów odskalowujemy je
                     scaler.unscale_(optimizer)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                    
-                    # Krok optymalizatora i aktualizacja scalera
+
                     scaler.step(optimizer)
                     scaler.update()
                     scheduler.step()
@@ -1982,97 +2171,131 @@ def train_and_save(model, train_loader, val_loader, num_classes, device, epochs_
                 running_loss += loss.item() * ACCUMULATION_STEPS
                 loop.set_postfix(
                     loss=f"{(loss.item() * ACCUMULATION_STEPS):.4f}",
-                    lr=f"{optimizer.param_groups[0]['lr']:.2e}"
+                    lr=f"{optimizer.param_groups[0]['lr']:.2e}",
                 )
 
             train_loss = running_loss / steps_per_epoch
 
-            # Zapis obrazu do pliku
-            save_debug_snapshots(model, val_loader, device, encoder, epoch)
-            
-            # Zapis do MLflow
+            save_debug_snapshots(model, val_loader, device, encoder, epoch, prefix="epoch")
+            if train_and_save.loader_pure_val:
+                save_debug_snapshots(model, train_and_save.loader_pure_val, device, encoder, epoch, prefix="pure_epoch")
+
             if HAS_MLFLOW:
                 snapshot_path = os.path.join(DEBUG_DIR, f"epoch_{epoch}_snapshot.png")
                 if os.path.exists(snapshot_path):
-                    mlflow.log_artifact(snapshot_path, artifact_path=f"snapshots/{phase_name}")
+                    mlflow.log_artifact(
+                        snapshot_path, artifact_path=f"snapshots/{phase_name}"
+                    )
 
             def get_cer_score(loader, debug_name=None):
-                if loader is None: return 1.0, [], []
-                
+                if loader is None:
+                    return 1.0, [], []
+
                 total_errors = 0.0
                 total_samples = 0
                 all_preds, all_targets = [], []
-                
+
                 with torch.no_grad():
                     for j, b_v in enumerate(loader):
-                        if j >= VAL_STEPS_LIMIT: break
+                        if j >= VAL_STEPS_LIMIT:
+                            break
                         b_v_c = [b.to(device) if torch.is_tensor(b) else b for b in b_v]
                         v_in, v_lbl, _, v_bnd, *rest = b_v_c
-                        
-                        v_out = model(v_in, word_context=None, confidence=None,
-                                      crnn_probs=None, boundaries=v_bnd, num_iterations=num_iterations)
-                        
-                        # Wektory kapsułkowe na prawdopodobieństwa
+
+                        v_out = model(
+                            v_in,
+                            word_context=None,
+                            confidence=None,
+                            crnn_probs=None,
+                            boundaries=v_bnd,
+                            num_iterations=num_iterations,
+                        )
+
                         v_probs = torch.nn.functional.softmax(v_out["norms"], dim=1)
                         top_probs, preds = torch.max(v_probs, 1)
-                        
-                        # Zbieranie logów do raportu
+
                         for p_idx, p_val, t_idx in zip(preds, top_probs, v_lbl):
                             char_pred = encoder.decode(p_idx.item())
                             char_target = encoder.decode(t_idx.item())
                             chance = p_val.item() * 100.0
-                            
+
                             all_preds.append(f"'{char_pred}' ({chance:.1f}%)")
                             all_targets.append(char_target)
 
-                        # Obliczanie ilości błędów w konkretnym batchu i akumulacja
                         batch_cer = calculate_cer(preds, v_lbl, encoder)
                         total_errors += batch_cer * v_lbl.size(0)
                         total_samples += v_lbl.size(0)
-                
-                # Ostateczny wynik CER
+
                 final_cer = total_errors / total_samples if total_samples > 0 else 1.0
                 return final_cer, all_preds, all_targets
 
             model.eval()
             metrics = {}
 
-            # Ewaluacja na PURE
             if train_and_save.loader_pure_val:
-                metrics['Pure'], _, _ = get_cer_score(train_and_save.loader_pure_val, debug_name="PURE")
+                metrics["Pure"], _, _ = get_cer_score(
+                    train_and_save.loader_pure_val, debug_name="PURE"
+                )
 
-            # Ewaluacja eMNIST
             if val_loader:
-                metrics['eMNIST'], _, _ = get_cer_score(val_loader, debug_name="EMNIST")
+                metrics["eMNIST"], _, _ = get_cer_score(val_loader, debug_name="EMNIST")
 
-            # Walidator HARD (Błędy CRNN)
             if phase_name == "HARD_MINING":
                 if train_and_save.loader_hard_val is None:
                     if os.path.exists(CRNN_CUSTOM_SAMPLES):
-                        ds_h = HardCharsDataset(CRNN_CUSTOM_SAMPLES, encoder=encoder, case_type="hard_case", transform=VAL_TRANSFORMS)
+                        clean_eval_transform = v2.Compose([
+                            v2.ToImage(),
+                            v2.Resize(IMAGE_SIZE, antialias=True),
+                            v2.ToDtype(torch.float32, scale=True),
+                            v2.Normalize(mean=EMNIST_NORM_MEAN, std=EMNIST_NORM_STD),
+                        ])
+                        ds_h = HardCharsDataset(
+                            CRNN_CUSTOM_SAMPLES,
+                            encoder=encoder,
+                            case_type="hard_case",
+                            transform=clean_eval_transform,
+                        )
                         if len(ds_h) > 0:
-                            train_and_save.loader_hard_val = DataLoader(ds_h, batch_size=BATCH_SIZE, num_workers=0)
+                            train_and_save.loader_hard_val = DataLoader(
+                                ds_h, batch_size=BATCH_SIZE, num_workers=0
+                            )
                         else:
-                            print(f" Katalog {CRNN_CUSTOM_SAMPLES} istnieje, ale nie znaleziono w nim obrazów.")
+                            print(
+                                f" Katalog {CRNN_CUSTOM_SAMPLES} istnieje, ale nie znaleziono"
+                                " w nim obrazów."
+                            )
                     else:
-                        print(f" Brak docelowego katalogu: {CRNN_CUSTOM_SAMPLES}. Pomięto ładowanie zbioru.")
+                        print(
+                            f" Brak docelowego katalogu: {CRNN_CUSTOM_SAMPLES}. Pomięto"
+                            " ładowanie zbioru."
+                        )
 
                 if train_and_save.loader_hard_val:
-                    metrics['Hard'], _, _ = get_cer_score(train_and_save.loader_hard_val)
+                    metrics["Hard"], _, _ = get_cer_score(train_and_save.loader_hard_val)
 
-            # Pobieramy wyniki w bezpieczny sposób
-            pure_val = metrics.get('Pure')
-            hard_val = metrics.get('Hard')
-            emnist_val = metrics.get('eMNIST', 1.0) 
+            pure_val = metrics.get("Pure")
+            hard_val = metrics.get("Hard")
+            emnist_val = metrics.get("eMNIST", 1.0)
 
-            # Jawne logowanie wszystkich metryk, by uniknąć złudzeń!
+            # Wcześniejsze odblokowanie Dropoutu, jeśli podstawowy routing na eMNIST już się ustabilizował
+            if not dropout_unlocked and emnist_val <= 0.15:
+                dropout_unlocked = True
+                tqdm.write(
+                    f"[{now()}] Osiągnięto próg stabilności (eMNIST CER: {emnist_val * 100:.2f}% <= 15%). "
+                    "Aktywacja Dropout od kolejnej epoki."
+                )
+
+            # Logowanie wyników epoki
             log_msg = f"[{now()}] WYNIKI EPOKI -> "
-            if metrics.get('eMNIST') is not None: log_msg += f"eMNIST: {emnist_val*100:.2f}%"
-            if pure_val is not None: log_msg += f" | PURE: {pure_val*100:.2f}%"
-            if hard_val is not None: log_msg += f" | HARD: {hard_val*100:.2f}%"
+            if metrics.get("eMNIST") is not None:
+                log_msg += f"eMNIST: {emnist_val*100:.2f}%"
+            if pure_val is not None:
+                log_msg += f" | PURE: {pure_val*100:.2f}%"
+            if hard_val is not None:
+                log_msg += f" | HARD: {hard_val*100:.2f}%"
             tqdm.write(log_msg)
 
-            # Wybieramy val_cer informacyjnie, do logów i statystyk checkpointu
+            # Wybieramy metrykę walidacyjną do monitorowania postępu w zależności od fazy treningu
             if phase_name == "HARD_MINING" and hard_val is not None:
                 val_cer = float(hard_val)
             elif pure_val is not None:
@@ -2080,54 +2303,86 @@ def train_and_save(model, train_loader, val_loader, num_classes, device, epochs_
             else:
                 val_cer = float(emnist_val)
 
-            # Logowanie metryk
+            epoch_bar.set_postfix(
+                loss=f"{train_loss:.4f}",
+                cer=f"{val_cer * 100:.2f}%",
+            )
+
+            # Logowanie metryk do MLflow, jeśli jest dostępne
             if HAS_MLFLOW:
-                mlflow.log_metrics({
-                    "train_loss": train_loss,
-                    "val_cer": val_cer,
-                    "emnist_cer": float(emnist_val),
-                    "pure_cer": float(pure_val) if pure_val is not None else 1.0,
-                    "hard_cer": float(hard_val) if hard_val is not None else 1.0,
-                    "learning_rate": optimizer.param_groups[0]['lr']
-                }, step=epoch)
+                mlflow.log_metrics(
+                    {
+                        "train_loss": train_loss,
+                        "val_cer": val_cer,
+                        "emnist_cer": float(emnist_val),
+                        "pure_cer": float(pure_val) if pure_val is not None else 1.0,
+                        "hard_cer": float(hard_val) if hard_val is not None else 1.0,
+                        "learning_rate": optimizer.param_groups[0]["lr"],
+                    },
+                    step=epoch,
+                )
 
-            # Logika
             is_best = False
-            current_train_loss = float(train_loss) if train_loss is not None else float('inf')
+            current_train_loss = (
+                float(train_loss) if train_loss is not None else float("inf")
+            )
 
-            # Zapisujemy model, gdy CER na walidacji spada
             if val_cer < best_val_cer:
                 is_best = True
-
-            # W przypadku remisu na walidacji (CER taki sam), sprawdzamy, czy funkcja straty spadła
             elif abs(val_cer - best_val_cer) < 1e-6 and current_train_loss < best_loss:
                 is_best = True
 
             if is_best:
                 best_loss = current_train_loss
-                best_val_cer = val_cer  # Aktualizujemy rekord CER jako statystykę towarzyszącą
+                best_val_cer = val_cer
 
-                torch.save({
-                    'model_state': model.state_dict(),
-                    'optimizer_state': optimizer.state_dict(),
-                    'best_loss': best_loss,
-                    'best_val_cer': best_val_cer,
-                    'phase': phase_name,
-                    'epoch': epoch
-                }, save_path)
-                tqdm.write(f"[{now()}] Nowy rekord ({phase_name})! Loss: {best_loss:.4f} | CER: {best_val_cer * 100:.2f}%")
+                ckpt_payload = {
+                    "model_state": model.state_dict(),
+                    "optimizer_state": optimizer.state_dict(),
+                    "best_loss": best_loss,
+                    "best_val_cer": best_val_cer,
+                    "phase": phase_name,
+                    "epoch": epoch,
+                }
+                """ Zapisujemy checkpoint w formacie .pth oraz dodatkowo z dopiskiem _best.pth, żeby łatwo było znaleźć
+                    najlepszy model w danej fazie, ale zapisywać informacje o ostatnim stanie w save_path """
+                torch.save(ckpt_payload, save_path)
+                torch.save(
+                    ckpt_payload,
+                    save_path.replace(".pth", f"_{phase_name.lower()}_best.pth"),
+                )
+                tqdm.write(
+                    f"[{now()}] Nowy rekord ({phase_name})! Loss: {best_loss:.4f} |"
+                    f" CER: {best_val_cer * 100:.2f}%"
+                )
                 patience_counter = 0
             else:
                 patience_counter += 1
-                tqdm.write(f"[{phase_name.upper()}] Brak poprawy Loss/CER ({patience_counter}/{max_patience}).")
+                tqdm.write(
+                    f"[{phase_name.upper()}] Brak poprawy Loss/CER"
+                    f" ({patience_counter}/{max_patience})."
+                )
 
             if patience_counter >= max_patience:
-                tqdm.write(f"[{now()}] Brak progresu przez {max_patience} epok. Przejście do następnej fazy.")
+                tqdm.write(
+                    f"[{now()}] Brak progresu przez {max_patience} epok. Przejście do"
+                    " następnej fazy."
+                )
                 break
-                
+
             tqdm.write(f"[{now()}] Loss: {train_loss:.4f} | CER: {val_cer * 100:.2f}%")
 
-            torch.save({'model_state': model.state_dict(), 'epoch': epoch, 'phase': phase_name}, save_path.replace(".pth", "_latest.pth"))
+            torch.save(
+                {
+                    "model_state": model.state_dict(),
+                    "epoch": epoch,
+                    "phase": phase_name,
+                },
+                save_path.replace(".pth", "_latest.pth"),
+            )
+
+        # Przywracamy bazowe wartości Dropout po wyjściu z pętli epok (niezbędne dla MC Dropout w predict_char)
+        model.set_dropout_state(True)
 
 
 def clear_memory(variable):
@@ -2169,76 +2424,83 @@ class EMNISTWithContext(Dataset):
         return image, torch.tensor(target_label, dtype=torch.long), zone, boundaries, context_vec, source_quality_weight
 
 
-def generate_confusion_matrix(model, loader, device, encoder, save_path, top_n=20):
-    """ Generuje macierz pomyłek dla TOP_N najczęściej mylonych par znaków i zapisuje pod wskazaną ścieżką. """
-    # Automatyczne tworzenie folderu, w którym ma znaleźć się plik
-    output_dir = os.path.dirname(save_path)
-    if output_dir and not os.path.exists(output_dir):
-        os.makedirs(output_dir, exist_ok=True)
+def generate_confusion_matrix(
+    model, loader, device, encoder, save_path, top_n=20
+):
+  """ Generuje macierz pomyłek dla TOP_N najczęściej mylonych par znaków i zapisuje pod wskazaną ścieżką. """
+  output_dir = os.path.dirname(save_path)
+  if output_dir and not os.path.exists(output_dir):
+    os.makedirs(output_dir, exist_ok=True)
 
-    model.eval()
-    all_preds, all_labels = [], []
+  model.eval()
+  all_preds, all_labels = [], []
 
-    tqdm.write(f"[{now()}] Rozpoczynam zbieranie danych do macierzy pomyłek.")
+  tqdm.write(f"[{now()}] Rozpoczynam zbieranie danych do macierzy pomyłek.")
 
-    with torch.no_grad():
-        for batch in tqdm(loader, desc="Ewaluacja Macierzy", leave=False):
-            # Rozpakowanie batcha (obsługa obrazów, etykiet i opcjonalnie innych danych)
-            images, labels = batch[0], batch[1]
-            images = images.to(device)
+  with torch.no_grad():
+    for batch in tqdm(loader, desc="Ewaluacja Macierzy", leave=False):
+      images, labels = batch[0], batch[1]
+      images = images.to(device)
 
-            # Forward pass (pobieramy tylko prawdopodobieństwa)
-            outputs = model(images)
-            probs = outputs[0] if isinstance(outputs, (list, tuple)) else outputs
+      outputs = model(images)
+      if isinstance(outputs, dict):
+        probs = outputs["probs"]
+      elif isinstance(outputs, (list, tuple)):
+        probs = outputs[0]
+      else:
+        probs = outputs
 
-            preds = torch.max(probs, 1)[1]
+      preds = torch.max(probs, 1)[1]
 
-            all_preds.extend(preds.cpu().numpy())
-            all_labels.extend(labels.cpu().numpy())
+      all_preds.extend(preds.cpu().numpy())
+      all_labels.extend(labels.cpu().numpy())
 
-    # Obliczenie pełnej macierzy
-    full_cm = confusion_matrix(all_labels, all_preds)
+  full_cm = confusion_matrix(all_labels, all_preds)
 
-    # Kopia do szukania błędów (zerujemy przekątną, by nie widzieć poprawnych klas)
-    cm_errors = full_cm.copy()
-    np.fill_diagonal(cm_errors, 0)
+  cm_errors = full_cm.copy()
+  np.fill_diagonal(cm_errors, 0)
 
-    # Szukanie TOP_N par z największą liczbą błędów
-    pairs = []
-    for i in range(cm_errors.shape[0]):
-        for j in range(cm_errors.shape[1]):
-            if cm_errors[i, j] > 0:
-                pairs.append(((i, j), cm_errors[i, j]))
+  pairs = []
+  for i in range(cm_errors.shape[0]):
+    for j in range(cm_errors.shape[1]):
+      if cm_errors[i, j] > 0:
+        pairs.append(((i, j), cm_errors[i, j]))
 
-    pairs.sort(key=lambda x: x[1], reverse=True)
-    top_pairs = pairs[:top_n]
+  pairs.sort(key=lambda x: x[1], reverse=True)
+  top_pairs = pairs[:top_n]
 
-    if not top_pairs:
-        tqdm.write(f"[{now()}] Brak błędów do wyświetlenia w macierzy!")
-        return
+  if not top_pairs:
+    tqdm.write(f"[{now()}] Brak błędów do wyświetlenia w macierzy!")
+    return
 
-    # Budowanie pod-macierzy do wizualizacji
-    unique_indices = sorted(list(set([p[0][0] for p in top_pairs] + [p[0][1] for p in top_pairs])))
-    subset_labels = [encoder.decode(idx) for idx in unique_indices]
-    idx_map = {orig: new for new, orig in enumerate(unique_indices)}
+  unique_indices = sorted(
+      list(set([p[0][0] for p in top_pairs] + [p[0][1] for p in top_pairs]))
+  )
+  subset_labels = [encoder.decode(idx) for idx in unique_indices]
+  idx_map = {orig: new for new, orig in enumerate(unique_indices)}
 
-    subset_cm = np.zeros((len(unique_indices), len(unique_indices)), dtype=int)
-    for r_orig in unique_indices:
-        for c_orig in unique_indices:
-            subset_cm[idx_map[r_orig], idx_map[c_orig]] = full_cm[r_orig, c_orig]
+  subset_cm = np.zeros((len(unique_indices), len(unique_indices)), dtype=int)
+  for r_orig in unique_indices:
+    for c_orig in unique_indices:
+      subset_cm[idx_map[r_orig], idx_map[c_orig]] = full_cm[r_orig, c_orig]
 
-    # Rysowanie i zapis
-    plt.figure(figsize=(12, 10))
-    sns.heatmap(subset_cm, annot=True, fmt='d', cmap='Reds',
-                xticklabels=subset_labels, yticklabels=subset_labels)
-    plt.ylabel('Prawdziwa Etykieta (True)')
-    plt.xlabel('Przewidziana Etykieta (Pred)')
-    plt.title(f'Macierz pomyłek - TOP {top_n} najczęstszych błędów')
+  plt.figure(figsize=(12, 10))
+  sns.heatmap(
+      subset_cm,
+      annot=True,
+      fmt="d",
+      cmap="Reds",
+      xticklabels=subset_labels,
+      yticklabels=subset_labels,
+  )
+  plt.ylabel("Prawdziwa Etykieta (True)")
+  plt.xlabel("Przewidziana Etykieta (Pred)")
+  plt.title(f"Macierz pomyłek - TOP {top_n} najczęstszych błędów")
 
-    plt.savefig(save_path, bbox_inches='tight', dpi=300)
-    plt.close()
+  plt.savefig(save_path, bbox_inches="tight", dpi=300)
+  plt.close()
 
-    tqdm.write(f"[{now()}] Macierz pomyłek zapisana: {save_path}")
+  tqdm.write(f"[{now()}] Macierz pomyłek zapisana: {save_path}")
 
 
 def seed_everything(seed: int = 3407):
@@ -2311,11 +2573,11 @@ class RAMCachedEMNIST(Dataset):
     def __getitem__(self, idx):
         # Konwersja z powrotem do float32 tylko dla aktualnie pobieranego elementu
         return (
-            self.images[idx],
+            self.images[idx].float(),
             self.labels[idx],
             self.zones[idx],
             torch.zeros(7, dtype=torch.float32),
-            self.contexts[idx],
+            self.contexts[idx].float(),
             torch.tensor(0.0, dtype=torch.float32)
         )
 
@@ -2375,40 +2637,35 @@ def build_fine_tune_loader(data_path, encoder, transform, batch_size, num_worker
 
 
 def build_hard_mining_loader(ds_emnist, ds_hard, ds_pure, ds_phsf, batch_size):
-    """ Loader dla Fazy hard mining. Dynamicznie łączy zbiory, nadając priorytet błędom CRNN oraz trudnym danym PHSF. """
+    """ Loader dla fazy HARD_MINING. Normalizuje wagi względem liczebności zbiorów,
+        aby błędy CRNN i realne wycinki dominowały nad kotwicą eMNIST. """
+    candidates = [
+        (ds_hard, 0.45),
+        (ds_pure, 0.25),
+        (ds_phsf, 0.20),
+        (ds_emnist, 0.10),
+    ]
+
     datasets_to_combine = []
     weights = []
 
-    # Baza: EMNIST (Waga 1.0 - fundament rozpoznawania kształtów)
-    if ds_emnist is not None:
-        datasets_to_combine.append(ds_emnist)
-        weights.extend([1.0] * len(ds_emnist))
-
-    # Błędy: Hard Mining (Waga 15.0 - bezpośrednie pomyłki modelu)
-    if ds_hard is not None:
-        datasets_to_combine.append(ds_hard)
-        weights.extend([15.0] * len(ds_hard))
-
-    # Realne pismo: (Waga 5.0 - współczesne próbki)
-    if ds_pure is not None:
-        datasets_to_combine.append(ds_pure)
-        weights.extend([5.0] * len(ds_pure))
-
-    # PHSF: Historyczne Formularze (Waga 10.0 - wysoki stopień trudności)
-    if ds_phsf is not None:
-        datasets_to_combine.append(ds_phsf)
-        weights.extend([10.0] * len(ds_phsf))
-
-    if not datasets_to_combine:
+    active = [(ds, share) for ds, share in candidates if ds is not None and len(ds) > 0]
+    if not active:
         print(f"[{now()}] Brak danych do budowy Hard Mining Loader!")
         return None
 
-    combined_ds = ConcatDataset(datasets_to_combine)
+    total_share = sum(share for _, share in active)
+    for ds, share in active:
+        norm_share = share / total_share
+        datasets_to_combine.append(ds)
+        weights.extend([norm_share / len(ds)] * len(ds))
 
-    # Sampler wymusza częstsze pojawianie się trudnych próbek w batchu
+    combined_ds = ConcatDataset(datasets_to_combine)
+    num_samples = min(len(combined_ds), STEPS_PER_EPOCH * batch_size)
+
     sampler = WeightedRandomSampler(
         weights=weights,
-        num_samples=len(combined_ds),
+        num_samples=num_samples,
         replacement=True
     )
 
@@ -2437,7 +2694,7 @@ class UniversalContextWrapper(Dataset):
         elif hasattr(dataset, 'dataset') and hasattr(dataset.dataset, 'encoder') and hasattr(dataset.dataset.encoder, 'get_num_classes'):
             self.num_classes = dataset.dataset.encoder.get_num_classes()
         else:
-            self.num_classes = 95  # Fallback zgodny z architekturą CRNN
+            self.num_classes = 94  # Fallback zgodny z architekturą CRNN
 
     def __len__(self):
         return len(self.dataset)
@@ -2449,19 +2706,48 @@ class UniversalContextWrapper(Dataset):
         # Uzupełnianie brakujących elementów (starsze formaty)
         if len(data) == 6:
             img, lbl, zone, bnd, ctx, conf = data
-            data = [img, lbl, zone, bnd, ctx, conf, torch.zeros(self.num_classes, dtype=torch.float32), torch.tensor(1, dtype=torch.long)]
+            data = [
+                img,
+                lbl,
+                zone,
+                bnd,
+                ctx,
+                conf,
+                torch.zeros(self.num_classes, dtype=torch.float32),
+                torch.tensor(1, dtype=torch.long),
+            ]
         elif len(data) == 7:
             img, lbl, zone, bnd, ctx, conf, probs = data
-            data = [img, lbl, zone, bnd, ctx, conf, probs, torch.tensor(1, dtype=torch.long)]
+            data = [
+                img,
+                lbl,
+                zone,
+                bnd,
+                ctx,
+                conf,
+                probs,
+                torch.tensor(1, dtype=torch.long),
+            ]
 
-        # wymuszamy zgodność wektora na indeksie crnn_probs z modelem
+        # Wymuszamy stałą zgodność kształtów i typu tensora dla DataLoadera
         if len(data) == 8:
-            probs = data[6]
+            ctx = torch.as_tensor(data[4], dtype=torch.float32).reshape(-1)
+            if ctx.shape[0] != self.context_size:
+                padded_ctx = torch.zeros(self.context_size, dtype=torch.float32)
+                min_ctx = min(ctx.shape[0], self.context_size)
+                padded_ctx[:min_ctx] = ctx[:min_ctx]
+                data[4] = padded_ctx
+            else:
+                data[4] = ctx
+
+            probs = torch.as_tensor(data[6], dtype=torch.float32).reshape(-1)
             if probs.shape[0] != self.num_classes:
                 padded_probs = torch.zeros(self.num_classes, dtype=torch.float32)
                 min_len = min(probs.shape[0], self.num_classes)
                 padded_probs[:min_len] = probs[:min_len]
                 data[6] = padded_probs
+            else:
+                data[6] = probs
 
         # Zwracamy z powrotem jako krotkę
         return tuple(data)
@@ -2614,10 +2900,10 @@ def run_phase(phase_id, model, device, encoder, current_zone_map, test_loader, n
         v2.ToImage(), # Przygotowanie wycinka z błędem wyeksportowanym z pierwszego etapu
         v2.Resize(IMAGE_SIZE, antialias=True), # Skalowanie w dół lub górę do stałego wejścia modelu
         v2.ToDtype(torch.float32, scale=True), # Konwersja na liczby zmiennoprzecinkowe wspierana przez moduł Głowicy Pewności
-        v2.RandomAffine(degrees=3, translate=(0.15, 0.15), scale=(0.6, 1.05), fill=0), # Silne zgniatanie geometryczne wzdłuż jednej osi, aby uodpornić model na zbitki (np. odróżnienie zgniecionego "d" od "cl")
-        v2.RandomApply([v2.ElasticTransform(alpha=18.0, sigma=3.0)], p=0.3), # Skrajne wyginanie atramentu zmuszające model do analizy nienaturalnych i zniekształconych fragmentów
-        EdgeErasing(p=0.40, scale=(0.10, 0.25)), # Agresywne ucinanie krawędzi - wymusza na module Certainty Head zrzucenie pewności blisko 0.0 przy drastycznych cięciach
-        AdversarialInkNoisingAgent(p=0.25, erase_scale=(0.01, 0.05), noise_std=0.15), # Dodajemy także szum i dziury w atramencie, stosując Agenta, by CapsNet nie polegał na gładkich krawędziach
+        v2.RandomAffine(degrees=4, translate=(0.12, 0.10), scale=(0.75, 1.08), shear=6, fill=0), # Zgniatanie geometryczne i przesunięcia w osi, aby uodpornić model na zbitki i błędy granic CTC (np. odróżnienie zgniecionego "d" od "cl")
+        v2.RandomApply([v2.ElasticTransform(alpha=14.0, sigma=3.0)], p=0.25), # Wyginanie atramentu zmuszające model do analizy nienaturalnych i zniekształconych fragmentów
+        EdgeErasing(p=0.35, scale=(0.03, 0.12)), # Kontrolowane ucinanie krawędzi - symuluje ciasne ramki CTC i wymusza na module Certainty Head spadek pewności przy ucięciach bez niszczenia tożsamości litery
+        AdversarialInkNoisingAgent(p=0.25, erase_scale=(0.01, 0.04), noise_std=0.15), # Dodajemy także szum i dziury w atramencie, stosując Agenta, by CapsNet nie polegał na gładkich krawędziach
         v2.Normalize(mean=EMNIST_NORM_MEAN, std=EMNIST_NORM_STD) # Finalna standaryzacja statystyczna przed wejściem do mechanizmów atencji CapsNetu
     ])
 
@@ -2667,20 +2953,27 @@ def run_phase(phase_id, model, device, encoder, current_zone_map, test_loader, n
         ds_p_val = torch.utils.data.Subset(full_ds_p_val, val_indices.indices)
         
         ds_p_train_wrapped = UniversalContextWrapper(ds_p_train)
-        train_and_save.loader_pure_val = DataLoader(UniversalContextWrapper(ds_p_val), batch_size=BATCH_SIZE, shuffle=False)
+        if len(ds_p_val) > 0:
+            train_and_save.loader_pure_val = DataLoader(UniversalContextWrapper(ds_p_val), batch_size=BATCH_SIZE, shuffle=False)
 
         phsf_dataset = PHSFDataset(npz_path=PHSF_DATA_PATH, encoder=encoder, transform=pure_transform_standard)
 
         # Wagowanie
-        datasets_to_combine = [ds_e, ds_p_train_wrapped]
+        datasets_to_combine = [ds_e]
         weights = []
         has_phsf = phsf_dataset is not None and len(phsf_dataset) > 0
+        has_pure = len(ds_p_train_wrapped) > 0
 
         w_e = 0.6 if has_phsf else 0.8  
-        w_p = 0.1 if has_phsf else 0.2
+        w_p = (0.1 if has_phsf else 0.2) if has_pure else 0.0
+        if not has_pure:
+            w_e += 0.1 if has_phsf else 0.2
 
         weights.extend([w_e / len(ds_e)] * len(ds_e))
-        weights.extend([w_p / len(ds_p_train_wrapped)] * len(ds_p_train_wrapped))
+
+        if has_pure:
+            datasets_to_combine.append(ds_p_train_wrapped)
+            weights.extend([w_p / len(ds_p_train_wrapped)] * len(ds_p_train_wrapped))
 
         if has_phsf:
             datasets_to_combine.append(phsf_dataset)
@@ -2723,7 +3016,8 @@ def run_phase(phase_id, model, device, encoder, current_zone_map, test_loader, n
         ds_p_train_wrapped = UniversalContextWrapper(ds_p_train)
         
         # Zabezpieczenie ciągłości loadera walidacyjnego na wypadek wznowienia od Fazy 2
-        train_and_save.loader_pure_val = DataLoader(UniversalContextWrapper(ds_p_val), batch_size=BATCH_SIZE, shuffle=False)
+        if len(ds_p_val) > 0:
+            train_and_save.loader_pure_val = DataLoader(UniversalContextWrapper(ds_p_val), batch_size=BATCH_SIZE, shuffle=False)
     
         ds_e = UniversalContextWrapper(EMNISTWithContext(
             datasets.EMNIST(root=DATA_ROOT_EMNIST, split='byclass', train=True, transform=emnist_transform_aggressive),
@@ -2731,15 +3025,21 @@ def run_phase(phase_id, model, device, encoder, current_zone_map, test_loader, n
 
         phsf_raw = PHSFDataset(npz_path=PHSF_DATA_PATH, encoder=encoder, transform=pure_transform_standard)
         
-        datasets_to_combine = [ds_e, ds_p_train_wrapped]
+        datasets_to_combine = [ds_e]
         weights = []
         has_phsf = phsf_raw is not None and len(phsf_raw) > 0
+        has_pure = len(ds_p_train_wrapped) > 0
 
         w_e = 0.1 if has_phsf else 0.2  # eMNIST tylko jako kotwica
-        w_p = 0.6 if has_phsf else 0.8
+        w_p = (0.6 if has_phsf else 0.8) if has_pure else 0.0
+        if not has_pure:
+            w_e += 0.6 if has_phsf else 0.8
 
         weights.extend([w_e / len(ds_e)] * len(ds_e))
-        weights.extend([w_p / len(ds_p_train_wrapped)] * len(ds_p_train_wrapped))
+
+        if has_pure:
+            datasets_to_combine.append(ds_p_train_wrapped)
+            weights.extend([w_p / len(ds_p_train_wrapped)] * len(ds_p_train_wrapped))
 
         if has_phsf:
             ds_phsf = UniversalContextWrapper(phsf_raw)
@@ -2755,42 +3055,75 @@ def run_phase(phase_id, model, device, encoder, current_zone_map, test_loader, n
         
 
     elif phase_id == 3:
-        tqdm.write(f"[{now()}] Faza HARD_MINING: Hard-Negative Mining (Błędy CRNN) + Czysta domena realna")
+        tqdm.write(f"[{now()}] Faza HARD_MINING: Hard Negative Mining na Błędach CRNN + PURE + PHSF, bez eMNIST.")
 
-        # Polegamy na wycinkach z błędy wyeksportowanych przez CRNN
         if not os.path.exists(CRNN_CUSTOM_SAMPLES) or len(os.listdir(CRNN_CUSTOM_SAMPLES)) == 0:
             tqdm.write(f"Brak wycinków CRNN w {CRNN_CUSTOM_SAMPLES}. Upewnij się, że CRNN zakończył eksport.")
 
-        # Ładowanie zbiorów
-        ds_e = UniversalContextWrapper(cached_emnist_train) 
-        ds_h = UniversalContextWrapper(HardCharsDataset(CRNN_CUSTOM_SAMPLES, encoder, "hard_case", crnn_error_transform))
-        ds_p = UniversalContextWrapper(HardCharsDataset(CRNN_CUSTOM_SAMPLES, encoder, "pure", pure_transform_standard))
+        clean_eval_transform = v2.Compose([
+            v2.ToImage(),
+            v2.Resize(IMAGE_SIZE, antialias=True),
+            v2.ToDtype(torch.float32, scale=True),
+            v2.Normalize(mean=EMNIST_NORM_MEAN, std=EMNIST_NORM_STD),
+        ])
 
-        # Wsparcie PHSF (jeśli istnieje)
+        full_ds_h_train = HardCharsDataset(CRNN_CUSTOM_SAMPLES, encoder, "hard_case", crnn_error_transform)
+        full_ds_h_val = HardCharsDataset(CRNN_CUSTOM_SAMPLES, encoder, "hard_case", clean_eval_transform)
+
+        if len(full_ds_h_train) > 1:
+            train_h_len = max(1, int(0.9 * len(full_ds_h_train)))
+            val_h_len = len(full_ds_h_train) - train_h_len
+            gen_h = torch.Generator().manual_seed(3407)
+            h_train_idx, h_val_idx = torch.utils.data.random_split(
+                list(range(len(full_ds_h_train))), [train_h_len, val_h_len], generator=gen_h
+            )
+            ds_h = UniversalContextWrapper(torch.utils.data.Subset(full_ds_h_train, h_train_idx.indices))
+            ds_h_val = UniversalContextWrapper(torch.utils.data.Subset(full_ds_h_val, h_val_idx.indices))
+            train_and_save.loader_hard_val = DataLoader(ds_h_val, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
+        else:
+            ds_h = UniversalContextWrapper(full_ds_h_train) if len(full_ds_h_train) > 0 else None
+
+        full_ds_p_train = HardCharsDataset(CRNN_CUSTOM_SAMPLES, encoder, "pure", pure_transform_standard)
+        full_ds_p_val = HardCharsDataset(CRNN_CUSTOM_SAMPLES, encoder, "pure", clean_eval_transform)
+        if len(full_ds_p_train) > 1:
+            train_p_len = max(1, int(0.9 * len(full_ds_p_train)))
+            val_p_len = len(full_ds_p_train) - train_p_len
+            gen_p = torch.Generator().manual_seed(3407)
+            p_train_idx, p_val_idx = torch.utils.data.random_split(
+                list(range(len(full_ds_p_train))), [train_p_len, val_p_len], generator=gen_p
+            )
+            ds_p = UniversalContextWrapper(torch.utils.data.Subset(full_ds_p_train, p_train_idx.indices))
+            if train_and_save.loader_pure_val is None and val_p_len > 0:
+                ds_p_val = UniversalContextWrapper(torch.utils.data.Subset(full_ds_p_val, p_val_idx.indices))
+                train_and_save.loader_pure_val = DataLoader(ds_p_val, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
+        else:
+            ds_p = UniversalContextWrapper(full_ds_p_train) if len(full_ds_p_train) > 0 else None
+
+        ds_e = UniversalContextWrapper(cached_emnist_train)
+
         phsf_raw = PHSFDataset(npz_path=PHSF_DATA_PATH, encoder=encoder, transform=pure_transform_standard)
         ds_phsf = UniversalContextWrapper(phsf_raw) if len(phsf_raw.samples) > 0 else None
 
-        # Loader zbalansuje wagi, faworyzując ds_h (błędy) i ds_phsf
         loader_hard = build_hard_mining_loader(
-            ds_emnist=ds_e, 
-            ds_hard=ds_h, 
-            ds_pure=ds_p, 
-            ds_phsf=ds_phsf, 
+            ds_emnist=ds_e,
+            ds_hard=ds_h,
+            ds_pure=ds_p,
+            ds_phsf=ds_phsf,
             batch_size=BATCH_SIZE
         )
 
         crnn_weights = torch.ones(num_classes).to(device)
         polish_indices = [encoder.char_to_idx[c] for c in "ąćęłńóśźżĄĆĘŁŃÓŚŹŻ" if c in encoder.char_to_idx]
         for idx in polish_indices:
-            crnn_weights[idx] = 2.5 
+            crnn_weights[idx] = 2.5
 
         model.freeze_backbone()
-        
+
         if loader_hard is not None:
             train_and_save(model, loader_hard, test_loader, num_classes, device, HARD_MINING_EPOCHS,
                            final_save_path, current_zone_map, crnn_weights, 3, HARD_MINING_LR, "HARD_MINING", checkpoint)
         else:
-            tqdm.write(f"[{now()}] Pomięto trening HARD_MINING z powodu braku danych w loaderze.")
+            tqdm.write(f"[{now()}] Pominięto trening HARD_MINING z powodu braku danych w loaderze.")
 
     with open(flag_path, 'w') as f:
         f.write('done')
@@ -2812,9 +3145,12 @@ if __name__ == "__main__":
     num_classes = encoder.get_num_classes()
     current_zone_map = get_zone_mapping(encoder)
 
-    # PyTorch optymalizuje graf obliczeniowy, szybsze obliczenia
-    base_model = CapsNet(num_classes).to(device)
-    model = torch.compile(base_model)
+    # Przyspieszenie operacji konwolucyjnych i mnożeń macierzowych bez modyfikacji grafu modelu
+    if torch.cuda.is_available():
+        torch.backends.cudnn.benchmark = True
+        torch.set_float32_matmul_precision("high")
+
+    model = CapsNet(num_classes).to(device)
 
     tqdm.write(f"[{now()}] Inicjalizacja połączenia ze zbiorem eMNIST.")
     base_emnist = datasets.EMNIST(root=DATA_ROOT_EMNIST, split='byclass', train=True, download=True, transform=EMNIST_TRANSFORM)
@@ -2866,17 +3202,19 @@ if __name__ == "__main__":
         v2.Normalize(mean=EMNIST_NORM_MEAN, std=EMNIST_NORM_STD)
     ])
 
+    # W fazie hard mining używamy transformacji agresywnej, by model nie polegał na łatwych cechach
     hard_test_transform = v2.Compose([
         v2.ToImage(),
         v2.Resize(IMAGE_SIZE, antialias=True),
         v2.ToDtype(torch.float32, scale=True),
-        v2.Normalize(mean=[my_mean], std=[my_std]) 
+        v2.Normalize(mean=EMNIST_NORM_MEAN, std=EMNIST_NORM_STD)
     ])
 
+    # Testowy zbiór używający eMNIST do oceny na idealnych danych, nie wyciętych przez CRNN
     ds_test_raw = datasets.EMNIST(root=DATA_ROOT_EMNIST, split='byclass', train=False,
                                   download=True, transform=emnist_test_transform)
 
-    # Zbiór testowy eMNIST z wymuszoną zgodnością wymiarów
+    # Zbiór testowy eMNIST z kontekstem i ujednoliconą strukturą 8-elementową
     translated_emnist = UniversalContextWrapper(EMNISTWithContext(ds_test_raw, encoder, current_zone_map))
     test_loader = DataLoader(
         dataset=translated_emnist,
@@ -2920,8 +3258,8 @@ if __name__ == "__main__":
             if checkpoint:
                 if 'model_state' in checkpoint:
                     model.load_state_dict(checkpoint['model_state'], strict=False)
-                    best_cer = checkpoint.get('best_cer', float('inf'))
-                    tqdm.write(f"[{now()}] Wagi załadowane. Rekord CER do pobicia: {best_cer:.2f}%")
+                    best_cer = checkpoint.get('best_val_cer', checkpoint.get('best_cer', float('inf')))
+                    tqdm.write(f"[{now()}] Wagi załadowane. Rekord CER do pobicia: {best_cer * 100:.2f}%")
 
                 tqdm.write(f"[{now()}] Planowany INITIAL_LR dla tej fazy: {INITIAL_LR}")
         except Exception as e:
@@ -2936,8 +3274,9 @@ if __name__ == "__main__":
 
     hard_data_path = os.path.join(CRNN_CUSTOM_SAMPLES, "hard_case")
 
-    # Ładowanie zbioru HardCharsDataset
-    if os.path.exists(hard_data_path) and len(os.listdir(hard_data_path)) > 0:
+    # Ładowanie zbioru HardCharsDataset (struktura: CRNN_CUSTOM_SAMPLES/<znak>/hard_case)
+    final_hard_loader = None
+    if os.path.exists(CRNN_CUSTOM_SAMPLES) and len(os.listdir(CRNN_CUSTOM_SAMPLES)) > 0:
         ds_hard_final = HardCharsDataset(
             root_dir=CRNN_CUSTOM_SAMPLES,
             encoder=encoder,
@@ -2958,10 +3297,10 @@ if __name__ == "__main__":
             hard_cer, hard_acc = calculate_cer_on_hard_cases(model, final_hard_loader, device, encoder, "Poprawa wątpliwości CRNN")
         else:
             hard_cer, hard_acc = 0.0, 0.0
-            print("Zbiór hard_case został zainicjowany, ale jest pusty.")
+            print("Zbiór hard_case jest pusty lub nie istnieje.")
     else:
         hard_cer, hard_acc = 0.0, 0.0
-        print("Brak folderu hard_case lub brak w nim danych.")
+        print("Brak folderu wycinków CRNN lub brak w nim danych.")
 
     # Wyświetlenie tabeli wyników
     print(f"RAPORT SKUTECZNOŚCI")
@@ -2972,9 +3311,6 @@ if __name__ == "__main__":
         f.write(f"Data raportu: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
         f.write(f" eMNIST         - CER: {emnist_cer * 100:.2f}%, ACC: {emnist_acc:.2f}%\n")
         f.write(f" Problematyczne - CER: {hard_cer * 100:.2f}%, ACC: {hard_acc:.2f}%\n")
-
-    # Rezerwacja nazwy na początku sekcji wynikowej
-    final_hard_loader = locals().get('final_hard_loader', None)
 
     # Wizualizacje
     print(f"[{now()}] Generowanie wizualizacji testowych.")
@@ -3005,19 +3341,3 @@ if __name__ == "__main__":
                 )
         else:
             print(f"[{now()}] Pominięto macierz Hard Mining: loader jest pusty lub nie istnieje.")
-
-""" systemd-inhibit docker run -it --rm --name trening_capsnet \
-     --gpus all \
-     --ipc=host \
-     --network=host \
-     --shm-size=16gb \
-     -e PYTHONUNBUFFERED=1 \
-     -e PYTHONPATH=/app \
-     -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-     -v /home/marek/.cache/torch:/root/.cache/torch \
-     -v /home/marek/OCR/HandwrittenTextRecognition/Data:/app/Data:rw \
-     -v /home/marek/OCR/HandwrittenTextRecognition/Data:/app/data:rw \
-     -v /home/marek/OCR/HandwrittenTextRecognition/output_data:/app/output_data \
-     -v /home/marek/OCR/HandwrittenTextRecognition/Models:/app/Models \
-     hcr-resnet-crnn:latest \
-     bash -c "python3 -m pip install --no-cache-dir langdetect shapiq gdown && python3 -m pip install --no-cache-dir --no-deps craft-text-detector && python3 -B Models/DeepCapsNetCharRecognition.py" """

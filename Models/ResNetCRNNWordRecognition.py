@@ -35,6 +35,8 @@ cv.ocl.setUseOpenCL(False)
 import h5py
 import numpy as np
 import seaborn as sns
+import mlflow
+from mlflow.exceptions import MlflowException
 import torch
 import torch.nn as nn
 import torch.nn.functional as func
@@ -54,6 +56,29 @@ from sklearn.metrics import confusion_matrix
 from Preprocessing.Preprocessing import Preprocessing # type: ignore . W Dockerze jest ok
 from craft_text_detector import Craft
 
+try:
+    from run_all import epoch_progress_bar, get_optimal_workers, smart_gpu_guard
+except ImportError:
+    def epoch_progress_bar(iterable, total_epochs: int, stage_name: str, initial: int = 0):
+        return tqdm(
+            iterable,
+            total=total_epochs,
+            initial=initial,
+            desc=f"{stage_name} | Epoki",
+            unit="ep",
+            bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]{postfix}",
+            dynamic_ncols=True,
+        )
+
+    def get_optimal_workers(max_workers: int = 4, ram_per_worker_gb: float = 2.5) -> int:
+        avail_gb = psutil.virtual_memory().available / (1024 ** 3)
+        return min(max_workers, max(0, int((avail_gb - 3.0) // ram_per_worker_gb)))
+
+    def smart_gpu_guard(min_free_ratio: float = 0.10, max_temp_c: int = 86) -> None:
+        if torch.cuda.is_available():
+            free_mem, total_mem = torch.cuda.mem_get_info()
+            if total_mem > 0 and (free_mem / total_mem) < min_free_ratio:
+                torch.cuda.empty_cache()
 
 def now():
     return time.strftime('%H:%M:%S')
@@ -76,23 +101,21 @@ except ImportError:
 except Exception as e:
     tqdm.write(f"[{now()}] Nieoczekiwany błąd zmiany priorytetu: {e}")
 
+# Konfiguracja środowiska
 IS_DOCKER = os.path.exists('/.dockerenv')
 
-# Konfiguracja środowiska
 if IS_DOCKER:
-    DATA_ROOT = "/app/Data"
-    CODE_ROOT = "/app"
-    SJP_DICTIONARY = "/app/Data/clean_corpus.txt" 
-    
+    BASE_PATH = "/app"
+    DATA_ROOT = "/app/data"
+    OUTPUT_BASE = os.path.join(BASE_PATH, "output_data")
     OUTPUT_NPZ = os.path.join(DATA_ROOT, "dataset.npz")
-    OUTPUT_BASE = os.path.join(CODE_ROOT, "output_data")
 else:
-    # Ścieżka uniwersalna dla Linuxa
-    DATA_ROOT = os.path.expanduser("~/OCR") 
-    
-    SJP_DICTIONARY = "/app/Data/output.txt"
-    OUTPUT_NPZ = os.path.join(DATA_ROOT, "PHSF", "dataset.npz")
-    OUTPUT_BASE = os.path.join(DATA_ROOT, "HandwrittenTextRecognition", "output_data")
+    BASE_PATH = os.path.expanduser("~/OCR/HandwrittenTextRecognition")
+    DATA_ROOT = os.path.join(BASE_PATH, "data")
+    OUTPUT_BASE = os.path.join(BASE_PATH, "output_data")
+    OUTPUT_NPZ = os.path.join(os.path.expanduser("~/OCR"), "PHSF", "dataset.npz")
+
+SJP_DICTIONARY = os.path.join(DATA_ROOT, "clean_corpus.txt")
 
 # Konfiguracja workerów (przeszedłem na Linux, więc więcej)
 WORKERS_MAIN = 4 # Augmentacje, więc więcej workerów, żeby je szybciej przygotować
@@ -104,12 +127,12 @@ DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 # Definicja głównego katalogu projektu (wewnątrz kontenera)
 if IS_DOCKER:
     BASE_PATH = "/app"
-    DATA_ROOT = "/app/Data"
+    DATA_ROOT = "/app/data"
     OUTPUT_BASE = os.path.join(BASE_PATH, "output_data")
 else:
     # Używamy ścieżki do lokalnego katalogu projektu
     BASE_PATH = os.path.expanduser("~/OCR/HandwrittenTextRecognition")
-    DATA_ROOT = os.path.join(BASE_PATH, "Data")
+    DATA_ROOT = os.path.join(BASE_PATH, "data")
     OUTPUT_BASE = os.path.join(BASE_PATH, "output_data")
 
 # Podstawowa ścieżka do zbioru IAM
@@ -834,19 +857,23 @@ class AdvancedHTRAugmentor:
     @staticmethod
     def ink_bleeding(image, **kwargs):
         """ Wykorzystuje ważoną dylatację i rozmycie Gaussa, uodparniając model na zmienną wilgotność papieru. """
-        # Zabezpieczenie przed błędem wymiarów OpenCV dla obrazów (H, W, 1)
+        # Zabezpieczenie przed błędem wymiarów OpenCV dla obrazów
         is_expanded = False
-        if image.ndim == 3 and image.shape[1] == 1:
+
+        # Sprawdzenie czy obraz jest w skali szarości i ma 3 wymiary (H, W, 1)
+        if image.ndim == 3 and image.shape[2] == 1:
             image = np.squeeze(image, axis=2)
             is_expanded = True
 
+        # Losowy współczynnik dylatacji, aby symulować różne poziomy wilgotności papieru
         strength = random.uniform(0.1, 0.25)
         kernel_size = 3
         kernel = np.ones((kernel_size, kernel_size), np.uint8)
         
         dilated = cv.dilate(image, kernel, iterations=1)
         bleeded = cv.addWeighted(image, 1 - strength, dilated, strength, 0)
-        
+
+        # Używamy kernela o rozmiarze 3, aby zachować krawędzie liter i nie rozmywać ich nadmiernie
         k_size = 3
         blurred = cv.medianBlur(bleeded, k_size)
         
@@ -1313,18 +1340,19 @@ def get_augmentations(phase):
                 alb.OpticalDistortion(distort_limit=0.2, shift_limit=0.1, p=1.0, border_mode=cv.BORDER_CONSTANT, value=0), # Wady skanera
             ], p=0.3),
 
-            # OneOf dla symulacji ubytków/plam
+            # Mniejsze dziury chronią krótkie wyrazy i znaki interpunkcyjne przed całkowitym zniknięciem
             alb.OneOf([
                 alb.CoarseDropout(
-                    max_holes=2, max_height=6, max_width=6, 
-                    min_holes=1, min_height=2, min_width=2, 
+                    max_holes=2, max_height=4, max_width=4,
+                    min_holes=1, min_height=2, min_width=2,
                     fill_value=0, p=1.0
-                ), # Mniejsze dziury chronią cienkie litery przed całkowitym zniknięciem
+                ),
                 alb.CoarseDropout(
-                    max_holes=3, max_height=8, max_width=8, 
+                    max_holes=2, max_height=5, max_width=5,
+                    min_holes=1, min_height=2, min_width=2,
                     fill_value=0, p=1.0
-                ), # Symuluje duże plamy atramentu
-            ], p=0.25),
+                ),
+            ], p=0.2),
 
             alb.Normalize(mean=IAM_MEAN, std=IAM_STD),
             ToTensorV2()
@@ -1449,27 +1477,31 @@ def collate_fn_dynamic(batch):
 
     # Obliczamy wartość tła do paddingu na podstawie globalnych statystyk nowej normalizacji
     bg_val = (0.0 - float(IAM_MEAN[0])) / float(IAM_STD[0])
+    side_pad = 16
 
     # Przetwarzamy obrazy pod kątem fizycznych wymagań sieci i CTC Loss
     processed_imgs = []
+    original_widths = []
     for img, label in zip(imgs, labels):
-        current_w = int(img.shape[-1])
-        min_w_needed = len(label) * 12
+        # Dodajemy symetryczne marginesy boczne, aby skrajne znaki nie dotykały krawędzi tensora
+        img_padded_sides = torch.nn.functional.pad(img, (side_pad, side_pad), value=bg_val)
+        current_w = int(img_padded_sides.shape[-1])
+        original_widths.append(current_w)
+
+        min_w_needed = len(label) * 12 + 2 * side_pad
 
         if current_w < min_w_needed:
             pad_right = min_w_needed - current_w
-            img = torch.nn.functional.pad(img, (0, pad_right), value=bg_val)
+            img_padded_sides = torch.nn.functional.pad(img_padded_sides, (0, pad_right), value=bg_val)
             current_w = min_w_needed
 
-        processed_imgs.append(img)
+        processed_imgs.append(img_padded_sides)
 
     # Szukamy najszerszego słowa w tym konkretnym batchu
     batch_max_w = max(int(img.shape[-1]) for img in processed_imgs)
 
     """ Zapisujemy informacje o oryginalnej szerokości przed nałożeniem paddingu. Dzięki temu funkcja CTC Loss wie,
         w którym dokładnie miejscu kończy się rzeczywisty tekst, a zaczyna pusta przestrzeń, co zapobiega zdominowaniu modelu przez spacje. """
-    original_widths = [int(img.shape[-1]) for img in imgs]
-
     padded_imgs = []
     for img in processed_imgs:
         curr_w = int(img.shape[-1])
@@ -1485,7 +1517,7 @@ def collate_fn_dynamic(batch):
 
     if extras:
         return padded, labels, categories, original_widths, *[list(field) for field in extras]
-
+    
     return padded, labels, categories, original_widths
 
 
@@ -1778,7 +1810,7 @@ def predict_with_tta(model, image, encoder, num_augmentations=3):
     return avg_log_probs
 
 
-def evaluate_loss_only(model, loader, device, encoder, use_tta=False, use_focal=True, focal_gamma=2.0):
+def evaluate_loss_only(model, loader, device, encoder, use_tta=False, use_focal=False, focal_gamma=2.0):
     """ Szybka ewaluacja modelu z paskiem postępu. Oblicza surową, średnią stratę na całym zbiorze walidacyjnym. """
     model.eval()
     total_loss = 0.0
@@ -2266,9 +2298,8 @@ class CenterLoss(nn.Module):
         
         # Obliczanie odległości euklidesowej między cechami a centroidami
         distmat = torch.pow(x, 2).sum(dim=1, keepdim=True).expand(batch_size, self.num_classes) + \
-                  torch.pow(self.centers, 2).sum(dim=1, keepdim=True).expand(self.num_classes, batch_size).t()
-        distmat = torch.pow(x, 2).sum(dim=1, keepdim=True).expand(batch_size, self.num_classes) + \
                   torch.pow(centers, 2).sum(dim=1, keepdim=True).expand(self.num_classes, batch_size).t()
+        distmat = distmat - 2.0 * torch.matmul(x, centers.t())
 
         # Wyciąganie odległości tylko dla poprawnych klas
         classes = torch.arange(self.num_classes).long().to(self.device)
@@ -2498,19 +2529,21 @@ def visualize_attention_map(model, image_tensor, save_path):
 
 def get_preds(lp):
     """Pomocnicza funkcja dekodująca prawdopodobieństwa z modelu CRNN."""
-    # Całkowite odcięcie tensora od grafu obliczeniowego (BFloat16) i wymuszenie float32, żeby uniknąć not supported dtype w dalszych operacjach numpy
+    # Całkowite odcięcie tensora od grafu obliczeniowego i wymuszenie float32, żeby uniknąć not supported dtype w dalszych operacjach numpy
     lp_safe = lp.detach().float()
     
-    p = torch.exp(lp_safe).permute(1, 0, 2)
+    # Wyjście ResNetCRNN to surowe logity, rozpatrywane przez softmax w celu uzyskania prawdopodobieństw
+    p = torch.softmax(lp_safe, dim=-1).permute(1, 0, 2)
     indices = torch.argmax(p, dim=-1).cpu().numpy()
     top2, _ = torch.topk(p, k=2, dim=-1)
-    
+
     # Rzutowanie każdego elementu z osobna
-    m = (top2[:, :, 0] - top2[:, :, 1]).float().cpu().numpy()
-    c = top2[:, :, 0].float().cpu().numpy()
-    p_np = p.float().cpu().numpy()
-    
+    m = (top2[:, :, 0] - top2[:, :, 1]).cpu().numpy()
+    c = top2[:, :, 0].cpu().numpy()
+    p_np = p.cpu().numpy()
+
     return p_np, indices, m, c
+    
 
 
 def get_safe_char_name(c):
@@ -2687,20 +2720,20 @@ def _save_ctc_slice(img_stn, windowed_ctx, crnn_probs_vec, char_gt, category, pr
     h, w = img_stn.shape
     start_x = max(0, int(x_left))
     end_x = min(w, int(x_right))
-    
+
     # Ochrona przed zbyt małym oknem
     if end_x - start_x < 5:
         return False
-        
+
     roi = img_stn[:, start_x:end_x]
-    
+
     # Lekki blur uodparnia na mikroszum wokół liter
     blur_roi = cv.GaussianBlur(roi, (3, 3), 0)
     _, roi_thresh = cv.threshold(blur_roi, 0, 255, cv.THRESH_BINARY_INV + cv.THRESH_OTSU)
-    
+
     # Poszukiwanie obrysu atramentu, żeby obciąć puste tło, z którym tu weszliśmy
     coords = cv.findNonZero(roi_thresh)
-    
+
     if coords is not None and len(coords) > 3:
         bx, by, bw, bh = cv.boundingRect(coords)
         if bw > 2 and bh > 2:
@@ -2711,60 +2744,77 @@ def _save_ctc_slice(img_stn, windowed_ctx, crnn_probs_vec, char_gt, category, pr
 
     if roi.shape[1] < 2 or roi.shape[0] < 2:
         return False
-        
+
     # Inicjalizujemy białe płótno pod CapsNet
     canvas = np.full((64, 64), 255, dtype=np.uint8)
     rh, rw = roi.shape
-    
+
     scale = 48.0 / max(rh, rw, 1)
-    
+
     # Zabezpieczenie przed rozciągnięciem na cały ekran drobinek typu '.' czy 'i'
     if char_gt in {'.', ',', "'", '-', ':', ';', 'i', 'l', 'I', '1'}:
-        scale = min(scale, 1.5) 
-        
+        scale = min(scale, 1.5)
+
     nrw, nrh = max(1, int(rw * scale)), max(1, int(rh * scale))
-    
+
     try:
         # Przeliczamy rozmiar wycinka
         resized_roi = cv.resize(roi, (nrw, nrh), interpolation=cv.INTER_AREA if scale < 1.0 else cv.INTER_CUBIC)
-        
+
         # Zabezpieczenie przed wyjściem poza 64x64
         nrw, nrh = min(nrw, 64), min(nrh, 64)
         resized_roi = resized_roi[:nrh, :nrw]
-        
+
         y_off = (64 - nrh) // 2
         x_off = (64 - nrw) // 2
         canvas[y_off:y_off+nrh, x_off:x_off+nrw] = resized_roi
-    except Exception:
+    except cv.error as e:
+        tqdm.write(f"[{now()}] Błąd OpenCV przy resize: {e}. Pomijam ten wycinek.")
+        return False
+    except ValueError as ve:
+        tqdm.write(f"[{now()}] ValueError przy resize: {ve}. Pomijam ten wycinek.")
+        return False
+    except Exception as e:
+        tqdm.write(f"[{now()}] Nieznany błąd przy resize: {e}. Pomijam ten wycinek.")
         return False
 
-    # Curriculum Learning: ocena pewności predykcji CRNN i zapisanie tylko tych, które są wystarczająco pewne
-    crnn_conf = crnn_probs_vec.max().item() if torch.is_tensor(crnn_probs_vec) else np.max(crnn_probs_vec)
-    canvas = curriculum_agent.apply(canvas, crnn_conf)
+    """ Curriculum Learning: ocena pewności predykcji CRNN i zapisanie tylko tych, które są wystarczająco pewne,
+        najpierw sprawdzamy, czy tensor nie jest pusty, a potem oceniamy pewność modelu CRNN. """
+    if crnn_probs_vec is None:
+        return False
+    is_empty = crnn_probs_vec.numel() == 0 if torch.is_tensor(crnn_probs_vec) else np.size(crnn_probs_vec) == 0
+    if is_empty:
+        return False
 
-    # Używamy globalnej funkcji chroniącej przed case-insensitivity w Windowsie
+    crnn_conf = float(crnn_probs_vec.max().item() if torch.is_tensor(crnn_probs_vec) else np.max(crnn_probs_vec))
+    if curriculum_agent is not None:
+        canvas = curriculum_agent.apply(canvas, crnn_conf)
+        if canvas is None:
+            return False
+
+    # Używamy globalnej funkcji get_safe_char_name, żeby uniknąć problemów z nazwami folderów w Windows
     char_folder_name = get_safe_char_name(char_gt)
-        
+
     target_dir = os.path.join(output_root, char_folder_name, category)
     os.makedirs(target_dir, exist_ok=True)
-    
+
     existing_count = len(os.listdir(target_dir))
-    if existing_count > 300 and not is_pure_mode:  
+    if existing_count > 300 and not is_pure_mode:
         return False
 
     # Zabezpieczamy również nazwę predykcji pliku przed nadpisaniem Windowsowym
     file_id = f"{existing_count:04d}_pred_{get_safe_char_name(pred_char)}"
     img_save_path = os.path.join(target_dir, f"{file_id}.png")
     npz_save_path = os.path.join(target_dir, f"{file_id}.npz")
-    
+
     cv.imwrite(img_save_path, canvas)
-    
+
     np.savez(
         npz_save_path,
         context_vector=windowed_ctx.detach().cpu().numpy() if torch.is_tensor(windowed_ctx) else windowed_ctx,
         crnn_probs=crnn_probs_vec.detach().cpu().numpy() if torch.is_tensor(crnn_probs_vec) else crnn_probs_vec
     )
-    
+
     return True
 
 
@@ -2800,26 +2850,33 @@ def export_error_crops_for_capsnet(model, loader, device, encoder, output_root, 
         Wykorzystuje inteligentne cięcie VPP, weryfikację szerokości i dynamiczny 
         zbiór pomyłek (JSON) bazujący na drugim wyborze modelu. """
     try:
-        import mlflow
         HAS_MLFLOW = True
         if mlflow.active_run():
             mlflow.end_run()
         mlflow.set_tracking_uri("http://127.0.0.1:5000")
         mlflow.set_experiment("CapsNet_Deep_Fusion_Data")
-    except Exception as e:
+    except (MlflowException, ConnectionError, TimeoutError, OSError, ValueError, RuntimeError) as e:
         HAS_MLFLOW = False
-        tqdm.write("Serwer MLflow niedostępny. Logowanie zdalne dla eksportu wyłączone.")
+        tqdm.write(f"Serwer MLflow niedostępny ({type(e).__name__}: {e}). Logowanie zdalne dla eksportu wyłączone.")
 
     if os.path.exists(output_root):
         try:
             shutil.rmtree(output_root)
+        except PermissionError as e:
+            tqdm.write(f"Brak uprawnień do usunięcia {output_root} (PermissionError): {e}. Kontynuuję.")
         except OSError as e:
-            tqdm.write(f"Nie można usunąć {output_root} (kod {e.errno}). Kontynuuję.")
+            tqdm.write(f"Nie można usunąć {output_root} (kod {e.errno}, {type(e).__name__}: {e}). Kontynuuję.")
     
     try:
         os.makedirs(output_root, exist_ok=True)
-    except Exception as e:
-        tqdm.write(f"Brak uprawnień do zapisu w {output_root}: {e}")
+    except PermissionError as e:
+        tqdm.write(f"Brak uprawnień do zapisu w {output_root} (PermissionError): {e}")
+        return
+    except OSError as e:
+        tqdm.write(f"Błąd systemu plików przy tworzeniu {output_root} ({type(e).__name__}: {e})")
+        return
+    except (ValueError, TypeError) as e:
+        tqdm.write(f"Nieprawidłowa ścieżka katalogu wyjściowego {output_root} ({type(e).__name__}: {e})")
         return
 
     export_stats = {"hard_case": 0, "squeezed": 0, "tricky": 0, "pure": 0}
@@ -3021,17 +3078,12 @@ def export_error_crops_for_capsnet(model, loader, device, encoder, output_root, 
                             prob_val = float(p1[b][t_curr].max())
                             crnn_probs_vec = p1[b][t_curr]
 
-                            # Korekta błędów etykietowania
-                            if is_wrong and pred_char.lower() == char_gt.lower():
-                                char_gt = pred_char
-                                is_wrong = False
-                                is_unstable = False
-
+                            # Poprawiamy wszystkie literówki, nie ograniczamy się do liter, bierzemy pod uwagę też wielkość
                             is_gt_typo = False
                             if is_wrong and prob_val > 0.80:
                                 g_low, p_low = char_gt.lower(), pred_char.lower()
                                 for pair in DIACRITIC_PAIRS:
-                                    if g_low in pair and p_low in pair:
+                                    if g_low in pair and p_low in pair and g_low != p_low:
                                         is_gt_typo = True
                                         break
                             
@@ -3276,7 +3328,7 @@ class PolishSyntheticDataset(Dataset):
         # Bezpiecznik
         if img is None or img.ndim < 2 or img.size == 0:
             img = np.zeros((64, 64), dtype=np.uint8)
-            word = "error" # Puste lub placeholder
+            word = "error"
         
         # Skalowanie zachowujące proporcje
         h, w = img.shape[:2]
@@ -3285,12 +3337,15 @@ class PolishSyntheticDataset(Dataset):
             new_w = max(16, int(w * scale))
             img = cv.resize(img, (new_w, 64), interpolation=cv.INTER_AREA)
 
+        # Wymuszenie 3. wymiaru (H, W, 1), aby ToTensorV2() zwrócił tensor 3D dla collate_fn_dynamic
+        if img.ndim == 2:
+            img = np.expand_dims(img, axis=-1)
+
         # Transformacje
         if self.transform:
             transformed = self.transform(image=img)
             img = transformed['image']
 
-        # obraz, etykieta
         return img, word
     
     def get_text(self, idx):
@@ -3453,9 +3508,19 @@ class CurriculumDataAgent:
         ])
 
     def apply(self, canvas_np, crnn_confidence):
-        # Konwersja na tensor PIL/Image dla transformacji
-        tensor_img = torch.from_numpy(canvas_np).unsqueeze(0).float() / 255.0
-        
+        if canvas_np is None:
+            return None
+
+        # Zachowujemy uint8, aby uniknąć szumu kwantyzacji tła
+        if np.issubdtype(canvas_np.dtype, np.floating):
+            img_uint8 = (np.clip(canvas_np, 0.0, 1.0) * 255.0).round().astype(np.uint8) if canvas_np.max() <= 1.0 else np.clip(canvas_np, 0, 255).astype(np.uint8)
+        else:
+            img_uint8 = canvas_np.astype(np.uint8, copy=False)
+
+        tensor_img = torch.from_numpy(img_uint8)
+        if tensor_img.ndim == 2:
+            tensor_img = tensor_img.unsqueeze(0)
+
         if crnn_confidence < 0.40:
             # Znak już jest trudny, chronimy ligatury
             augmented = self.protective_transform(tensor_img)
@@ -3466,8 +3531,11 @@ class CurriculumDataAgent:
             # Prosty znak więc wymuszamy trudniejsze warunki
             augmented = self.aggressive_transform(tensor_img)
 
-        # Powrót do uint8
-        return (augmented.squeeze(0).numpy() * 255.0).astype(np.uint8)
+        # Powrót do 0-255, dające pełną skalę szarości dla CapsNet
+        augmented = augmented.squeeze(0).detach().cpu()
+        if augmented.is_floating_point():
+            return (augmented.clamp(0.0, 1.0).numpy() * 255.0).round().astype(np.uint8)
+        return augmented.clamp(0, 255).numpy().astype(np.uint8)
 
 
 def generate_final_report(results, output_path="final_report.txt", plot_path="uncertainty_stats.png"):
@@ -3703,6 +3771,76 @@ def calibrate_blank_threshold(model, val_loader, device, encoder, num_batches=20
     return best_thresh
 
 
+def build_length_balanced_sampler(iam_ds, polish_ds, alpha=0.3, min_weight=0.5, max_weight=2.0, current_epoch=0, total_epochs=17):
+    """ Tworzy sampler z płynnym harmonogramem kooperacyjnym:
+    - long: startuje wysoko (nauka sekwencji RNN), z czasem opada.
+    - polish_diacritic: startuje nisko, z czasem rośnie (dopracowanie detali na bazie).
+    - short i medium: stanowią płynny, dynamiczny bufor pośredni (współpracują z głównym trendem). """
+    polish_diacritics = set("ĄĆĘŁŃÓŚŹŻąćęłńóśźż")
+    all_categories = []
+
+    # Kategoryzacja słów z IAM_Train
+    for label in iam_ds.valid_labels:
+        if any(c in polish_diacritics for c in label):
+            all_categories.append("polish_diacritic")
+        else:
+            length = len(label)
+            cat = 'short' if length < 5 else ('medium' if length < 9 else 'long')
+            all_categories.append(cat)
+
+    # Kategoryzacja słów z PolishSynthetic_Train
+    for idx in range(len(polish_ds)):
+        w_txt = polish_ds.get_text(idx) if hasattr(polish_ds, 'get_text') else ""
+        if any(c in polish_diacritics for c in w_txt):
+            all_categories.append("polish_diacritic")
+        elif len(w_txt) < 5:
+            all_categories.append('short')
+        else:
+            all_categories.append('medium' if len(w_txt) < 9 else 'long')
+
+    category_counts = Counter(all_categories)
+    total_samples = max(len(all_categories), 1)
+    num_cats = max(len(category_counts), 1)
+
+    empirical_weights = {
+        cat: ((total_samples / (num_cats * max(count, 1))) ** alpha)
+        for cat, count in category_counts.items()
+    }
+
+    # Obliczamy postęp treningu od 0.0 do 1.0
+    progress = min(1.0, max(0, current_epoch) / max(1, total_epochs - 1))
+
+    # Z postępem epok long maleje, diacritics rosną, chodzi o to, że w pierwszych epokach chcemy nauczyć model sekwencji, a później dopracować detale
+    long_priority = 1.45 - (1.45 - 0.95) * progress
+    diacritic_priority = 0.85 + (1.55 - 0.85) * progress
+
+    # Bufor pośredni, żeby krótkie i średnie formy dostosowywały się do trendu
+    short_priority = 1.0 + 0.15 * (1.0 - progress)    # Na początku lekko wspiera krótkie formy
+    medium_priority = 1.0 + 0.10 * progress          # W późniejszej fazie lekko podbija medium jako stabilizator
+
+    visual_priority = {
+        "short": round(short_priority, 3),
+        "medium": round(medium_priority, 3),
+        "long": round(long_priority, 3),
+        "polish_diacritic": round(diacritic_priority, 3)
+    }
+
+    raw_weights_map = {
+        cat: empirical_weights.get(cat, 1.0) * visual_priority.get(cat, 1.0)
+        for cat in visual_priority
+    }
+
+    mean_w = sum(raw_weights_map.values()) / len(raw_weights_map)
+    weights_map = {
+        cat: round(min(max(w / mean_w, min_weight), max_weight), 4)
+        for cat, w in raw_weights_map.items()
+    }
+
+    weights = [weights_map[cat] for cat in all_categories]
+    balanced_sampler = WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
+    return balanced_sampler, weights_map, category_counts
+
+
 if __name__ == "__main__":
     # Gwarancja determinizmu
     torch.backends.cudnn.deterministic = True
@@ -3720,11 +3858,13 @@ if __name__ == "__main__":
         pass # Metoda została już ustawiona
     
     try:
-        import mlflow
         HAS_MLFLOW = True
         mlflow.set_tracking_uri("http://127.0.0.1:5000")
         mlflow.set_experiment("CRNN_Word_Recognition")
         mlflow.start_run(run_name="Main_and_Finetune")
+    except (mlflow.exceptions.RestException, ConnectionError):
+        HAS_MLFLOW = False
+        print("Serwer MLflow nie odpowiada (uruchom 'mlflow server' w osobnej konsoli). Logowanie zdalne wyłączone, trening kontynuowany lokalnie.")
     except Exception as e:
         HAS_MLFLOW = False
         print("Serwer MLflow nie odpowiada (uruchom 'mlflow server' w osobnej konsoli). Logowanie zdalne wyłączone, trening kontynuowany lokalnie.")
@@ -3832,42 +3972,21 @@ if __name__ == "__main__":
         os.path.join(CHECKPOINT_FOLDER, "checkpoint.pth")
     ]
 
-    found_path = next((p for p in potential_checkpoints if os.path.exists(p)), None)
-    weights_loaded = False
-
-    if found_path:
-        tqdm.write(f"[{now()}] Ładowanie wag z: {os.path.basename(found_path)}")
-        # Korzystamy z Twojej wbudowanej metody odpornej na zmiany alfabetu
-        loaded_epoch = model.load_weights(found_path, device=DEVICE)
-        if loaded_epoch > 0:
-            last_total_epoch = loaded_epoch
-        weights_loaded = True
-
-        # Inicjalizacja EMA i bezpieczna synchronizacja
-        ema_avg = lambda avg, model_p, num_avg: 0.999 * avg + 0.001 * model_p
-        ema_model = AveragedModel(model, avg_fn=ema_avg, device=torch.device('cpu'))
-
-        if weights_loaded:
-            ema_model.update_parameters(model)
-            tqdm.write(f"[{now()}] EMA zsynchronizowane z wczytanymi wagami.")
-
-    scaler = torch.amp.GradScaler('cuda')
-
     # Szukamy dostępnych wag
-    potential_checkpoints = [
-        os.path.join(CHECKPOINT_FOLDER, "best_cer_model.pth"),
-        os.path.join(CHECKPOINT_FOLDER, "WordLevelResNetCRNN.pth"),
-        os.path.join(CHECKPOINT_FOLDER, "checkpoint.pth")
-    ]
-
     found_path = next((p for p in potential_checkpoints if os.path.exists(p)), None)
     if found_path:
         tqdm.write(f"[{now()}] Ładowanie wag z: {os.path.basename(found_path)}")
         loaded_epoch = model.load_weights(found_path, device=DEVICE)
 
         # Jeśli plik nie miał zapisanego numeru epoki, zostajemy przy tym z historii
-        if loaded_epoch > 0: last_total_epoch = loaded_epoch
-        model.eval()
+        if loaded_epoch > 0:
+            last_total_epoch = loaded_epoch
+
+        # Synchronizacja EMA z wczytanymi wagami, żeby uniknąć rozbieżności przy pierwszym kroku optymalizacji
+        ema_model.update_parameters(model)
+        tqdm.write(f"[{now()}] EMA zsynchronizowane z wczytanymi wagami.")
+
+    scaler = torch.amp.GradScaler('cuda')
 
     # Przygotowanie danych
     if not os.path.exists(DATA_ROOT):
@@ -3884,21 +4003,25 @@ if __name__ == "__main__":
 
     # Ładowanie do RAM - zapobiega OOM
     tqdm.write(f"[{now()}] Ładowanie polskiego alfabetu do głównej pamięci RAM.")
-    npz_data = np.load(OUTPUT_NPZ, allow_pickle=True)
-    raw_images = npz_data['signs']
-    npz_labels = npz_data['labels']
-    
     global_char_map = {}
-    for i, char in enumerate(npz_labels):
-        img = raw_images[i].copy() 
-        if np.mean(img) > 127:
-            img = 255 - img
-        if char not in global_char_map:
-            global_char_map[char] = []
-        global_char_map[char].append(img)
+    
+    if os.path.exists(OUTPUT_NPZ):
+        npz_data = np.load(OUTPUT_NPZ, allow_pickle=True)
+        raw_images = npz_data['signs']
+        npz_labels = npz_data['labels']
         
-    del npz_data, raw_images, npz_labels # Czyścimy śmieci po wczytaniu
-    tqdm.write(f"[{now()}] Gotowe. Zbudowano mapę dla {len(global_char_map)} unikalnych znaków.")
+        for i, char in enumerate(npz_labels):
+            img = raw_images[i].copy() 
+            if np.mean(img) > 127:
+                img = 255 - img
+            if char not in global_char_map:
+                global_char_map[char] = []
+            global_char_map[char].append(img)
+            
+        del npz_data, raw_images, npz_labels # Czyścimy śmieci po wczytaniu
+        tqdm.write(f"[{now()}] Gotowe. Zbudowano mapę dla {len(global_char_map)} unikalnych znaków PHSF.")
+    else:
+        print(f'[WARNING] Brak pliku PHSF {OUTPUT_NPZ} – pomijam ładowanie glifów PHSF.')
 
     # Tworzenie zbioru IAM
     train_iam = IAMWordDataset(h5_path=IAM_WORDS_H5_PATH, 
@@ -3913,64 +4036,42 @@ if __name__ == "__main__":
                              name="IAM_Val",
                              split='val')
 
-    # Ręczny podział słów
-    split_idx = int(0.9 * len(polish_words_list))
-    train_polish_words = polish_words_list[:split_idx]
-    val_polish_words = polish_words_list[split_idx:]
+    # Sprawdzamy czy mamy dane syntetyczne PHSF, żeby uniknąć błędów przy pustej mapie
+    if len(global_char_map) > 0:
+        # Ręczny podział słów
+        split_idx = int(0.9 * len(polish_words_list))
+        train_polish_words = polish_words_list[:split_idx]
+        val_polish_words = polish_words_list[split_idx:]
 
-    train_polish = PolishSyntheticDataset(char_map=global_char_map, 
-                                          word_list=train_polish_words,
-                                          transform=get_augmentations("main"), 
-                                          num_samples=12000)
+        train_polish = PolishSyntheticDataset(char_map=global_char_map, 
+                                              word_list=train_polish_words,
+                                              transform=get_augmentations("main"), 
+                                              num_samples=12000)
 
-    val_polish = PolishSyntheticDataset(char_map=global_char_map, 
-                                        word_list=val_polish_words,
-                                        transform=val_transform_crnn, # Czysty obraz
-                                        num_samples=1333) # 10% z 12000 dla zachowania proporcji
-
-    # Łączymy w zbiory
-    train_dataset = ConcatDataset([train_iam, train_polish])
-    val_dataset = ConcatDataset([val_iam, val_polish])
+        val_polish = PolishSyntheticDataset(char_map=global_char_map, 
+                                            word_list=val_polish_words,
+                                            transform=val_transform_crnn, 
+                                            num_samples=1333)
+        
+        train_dataset = ConcatDataset([train_iam, train_polish])
+        val_dataset = ConcatDataset([val_iam, val_polish])
+    else:
+        print("Brak glifów PHSF – trenuję wyłącznie na zbiorze IAM!")
+        train_polish = []
+        train_dataset = train_iam
+        val_dataset = val_iam
 
     print(f"[{now()}] Całkowita liczba próbek: {len(train_dataset) + len(val_dataset)}")
     print(f"[{now()}] Próbki treningowe: {len(train_dataset)}, walidacyjne: {len(val_dataset)}")
 
-    # Dynamiczne ważenie
-    all_categories = []
+    # Dynamiczne ważenie z priorytetem dla SHORT i MEDIUM (LONG odrobi później Transformer)
     polish_diacritics = set("ĄĆĘŁŃÓŚŹŻąćęłńóśźż")
-    
-    # Kategoryzacja słów z IAM_Train
-    for label in train_iam.valid_labels:
-        if any(c in polish_diacritics for c in label):
-            all_categories.append("polish_diacritic")
-        else:
-            length = len(label)
-            cat = 'short' if length < 5 else ('medium' if length < 9 else 'long')
-            all_categories.append(cat)
 
-    # Kategoryzacja słów z PolishSynthetic_Train
-    for _ in range(len(train_polish)):
-        all_categories.append("polish_diacritic")
-
-    # Obliczanie wag dynamicznych
-    category_counts = Counter(all_categories)
-    max_count = max(category_counts.values())
-
-    """ Definiujemy wagi - polish_diacritic dostaje boost, żeby model zwracał szczególną uwagę na te znaki
-        (w większości różnią się tylko ogonkiem lub kreską, więc są trudniejsze do rozróżnienia). """
-    dynamic_weights_map = {
-        "short": math.sqrt(max_count / max(category_counts["short"], 1)),
-        "medium": math.sqrt(max_count / max(category_counts["medium"], 1)),
-        "long": math.sqrt(max_count / max(category_counts["long"], 1)),
-        "polish_diacritic": math.sqrt(max_count / max(category_counts["polish_diacritic"], 1)) * 1.5  # Boost dla polskich znaków
-    }
+    sampler, dynamic_weights_map, category_counts = build_length_balanced_sampler(train_iam, train_polish)
 
     tqdm.write(f"[{now()}] Liczebność klas w treningu: {dict(category_counts)}")
     weights_str = ", ".join([f"{k}: {v:.2f}" for k, v in dynamic_weights_map.items()])
     tqdm.write(f"[{now()}] Wagi Balansujące: {weights_str}")
-
-    weights = [dynamic_weights_map[cat] for cat in all_categories]
-    sampler = WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
 
     # Loader używa hybrydowego samplera łączącego polskie znaki już wcześniej
     train_loader = DataLoader(
@@ -4014,29 +4115,18 @@ if __name__ == "__main__":
             else:
                 decay_params.append(param)
 
-        """ Optymalizator NAdam (Nesterov-accelerated Adaptive Moment Estimation):
-            Zastosowanie wariantu NAdam podyktowane jest złożonością przestrzeni błędu w architekturze 
-            hybrydowej (ResNet + BiLSTM). W przeciwieństwie do klasycznego Adama, NAdam wykorzystuje 
-            pęd Nesterova, który włącza do mianownika wyprzedzającą estymację przyszłej pozycji gradientu. 
-            Skutkuje to wyższym tłumieniem oscylacji w wąskich minimach lokalnych i zapobiega 
-            przeskakiwaniu optymalnych rozwiązań przy agresywnym tempie uczenia.
-            
-            Znaczenie parametru Epsilon:
-            Zapewnia on nie tylko stabilność numeryczną (chroni przed błędem dzielenia przez zero w 
-            mianowniku), ale pełni rolę bezpiecznika regularyzacyjnego. Twardo ogranicza maksymalny 
-            krok aktualizacji dla wag o mikroskopijnej wariancji gradientu, chroniąc wyuczone już 
-            filtry wizualne przed destrukcyjnymi skokami wywołanymi zaszumionymi próbkami. """
         optimizer = optim.NAdam([
-        {
-        'params': decay_params, 
-        'weight_decay': 5e-5  # Lekka regularyzacja dla wag głównych
-        },
-        {
-        'params': no_decay_params, 
-        'weight_decay': 0.0   # Brak regularyzacji dla biasów i BatchNorm
-        }
+            {
+                'params': decay_params,
+                'weight_decay': 5e-5  # Lekka regularyzacja dla wag głównych
+            },
+            {
+                'params': no_decay_params,
+                'weight_decay': 0.0   # Brak regularyzacji dla biasów i BatchNorm
+            }
         ], lr=LR_MAIN / DIV_FACTOR)
 
+        # Liczba kroków na epokę liczona przed pętlą z aktualnego train_loader
         steps_per_epoch = math.ceil(int(len(train_loader)) / int(ACCUMULATION_STEPS_MAIN))
         main_scheduler = optim.lr_scheduler.OneCycleLR(
             optimizer, max_lr=LR_MAIN,
@@ -4051,16 +4141,43 @@ if __name__ == "__main__":
                 main_scheduler.step()
 
         patience_counter = 0
-        for epoch in range(start_ep, EPOCHS_MAIN):
-            tqdm.write(f"[{now()}] Epoka {epoch + 1} Main")
+        main_epoch_bar = epoch_progress_bar(
+            range(start_ep, EPOCHS_MAIN),
+            total_epochs=EPOCHS_MAIN,
+            stage_name="CRNN Main",
+            initial=start_ep,
+        )
+        for epoch in main_epoch_bar:
+            main_epoch_bar.set_description_str(f"CRNN Main | Epoka {epoch + 1}/{EPOCHS_MAIN}")
+            sampler, dynamic_weights_map, category_counts = build_length_balanced_sampler(
+                train_iam,
+                train_polish,
+                current_epoch=epoch,
+                total_epochs=EPOCHS_MAIN,
+            )
+            weights_str = ", ".join([f"{k}: {v:.2f}" for k, v in dynamic_weights_map.items()])
+            tqdm.write(f"[{now()}] Epoka {epoch + 1}/{EPOCHS_MAIN} Main | Wagi Balansujące: {weights_str}")
+
+            train_loader = DataLoader(
+                train_dataset,
+                batch_size=BATCH_SIZE,
+                sampler=sampler,
+                shuffle=False,
+                num_workers=WORKERS_MAIN,
+                collate_fn=collate_fn_dynamic,
+                pin_memory=(WORKERS_MAIN > 0),
+                prefetch_factor=2 if WORKERS_MAIN > 0 else None,
+                persistent_workers=False,
+                worker_init_fn=worker_init_fn
+            )
 
             # Wykonujemy trening epoki
             current_gamma = get_focal_gamma_schedule(epoch, EPOCHS_MAIN, start_gamma=2.5, end_gamma=1.5)
-            
+
             # Bez głowicy kontrastowej, na początek model uczy się czytać
             t_loss, e_lrs, e_moms = train_one_epoch(
-                model, train_loader, optimizer, scaler, DEVICE, encoder, 
-                scheduler=main_scheduler, cat_weights=dynamic_weights_map, 
+                model, train_loader, optimizer, scaler, DEVICE, encoder,
+                scheduler=main_scheduler, cat_weights=dynamic_weights_map,
                 epoch=epoch, focal_gamma=current_gamma, use_focal=False,
                 use_contrastive=False, writer=writer, acc_steps=ACCUMULATION_STEPS_MAIN,
             )
@@ -4083,6 +4200,7 @@ if __name__ == "__main__":
                 writer.add_scalar('Loss/Train_Epoch', t_loss, epoch)
                 writer.add_scalar('Loss/Validation_Epoch', val_loss, epoch)
 
+            main_epoch_bar.set_postfix(loss=f"{t_loss:.4f}", val=f"{val_loss:.4f}")
             tqdm.write(f"          Loss: {t_loss:.4f} | Val Loss: {val_loss:.4f} | Gamma: {current_gamma:.2f}")
 
             last_main_epoch = epoch + 1
@@ -4094,7 +4212,7 @@ if __name__ == "__main__":
                 # Tworzymy słownik danych do zapisu
                 checkpoint_data = {
                     'model_state': model.state_dict(),
-                    'ema_state': ema_model.state_dict(),
+                    'ema_state': ema_model.module.state_dict() if ema_model is not None else model.state_dict(),
                     'optimizer_state': optimizer.state_dict(),
                     'scheduler_state': main_scheduler.state_dict(),
                     'scaler_state': scaler.state_dict(),
@@ -4107,7 +4225,7 @@ if __name__ == "__main__":
                 torch.save(checkpoint_data, CHECKPOINT_PATH)
                 torch.save(model.state_dict(), CER_PATH) # Zapasowy model
                 tqdm.write(f"            └─> Nowy rekord! Zapisano checkpoint modelu.")
-            
+
             else:
                 # Jeśli błąd nie spadł, zwiększamy licznik cierpliwości
                 patience_counter += 1
@@ -4123,11 +4241,11 @@ if __name__ == "__main__":
         # Generowanie wykresu po zakonczeniu wszystkich epok w Main
         if 'step_lrs' in history and history['step_lrs']:
             plot_scheduler(history['step_lrs'], history['step_moms'], filename="actual_scheduler_main.png")
-            
+
             # Zapis do MLFLOW
             if HAS_MLFLOW:
                 mlflow.log_artifact(
-                    local_path=os.path.join(VISUAL_DEBUG_DIR, "actual_scheduler_main.png"), 
+                    local_path=os.path.join(VISUAL_DEBUG_DIR, "actual_scheduler_main.png"),
                     artifact_path="schedulers" # Folder wewnątrz dashboardu
                 )
 
@@ -4141,55 +4259,85 @@ if __name__ == "__main__":
         del train_loader, val_loader
         gc.collect()
         torch.cuda.empty_cache()
-    
+
     # Ścieżka do najlepszego modelu z fazy Main
     best_main_model_path = os.path.join(CHECKPOINT_FOLDER, "best_cer_model.pth")
-    
+
     if os.path.exists(best_main_model_path):
         try:
             # Ładujemy plik na CPU, żeby uniknąć wycieków pamięci VRAM
             tmp_checkpoint = torch.load(best_main_model_path, map_location='cpu', weights_only=False)
-            
+
             # Sprawdzamy, czy plik to słownik zawierający klucze
             if isinstance(tmp_checkpoint, dict):
                 early_stopping_epoch = tmp_checkpoint.get('epoch', 0)
             else:
                 print(f"[{now()}] Plik checkpointu zawiera same wagi (brak metadanych). Przyjęto epokę 0.")
-                
-            del tmp_checkpoint # Ręczne sprzątanie RAM-u
-            
+
+            del tmp_checkpoint # Ręczne sprzątanie RAMu
+
+        except FileNotFoundError:
+            print(f"[{now()}] Nie znaleziono pliku checkpointu. Przyjęto epokę 0.")
+        except KeyError:
+            print(f"[{now()}] Brak klucza 'epoch' w checkpointcie. Przyjęto epokę 0.")
         except Exception as e:
             print(f"[{now()}] Nie udało się odczytać epoki z checkpointu ({type(e).__name__}: {e}). Przyjęto 0.")
+            
 
-    # Fine-tune
+    # Fine tune
     if os.path.exists(MAIN_PHASE_COMPLETE_FILE) and not os.path.exists(FINE_COMPLETE_FILE):
         tqdm.write(f"[{now()}] Rozpoczynam Fazę Fine-tune.")
         
-        # Tworzymy zbiory z nowymi, delikatniejszymi augmentacjami dla fine-tuning
+        # Tworzymy zbiory z nowymi, delikatniejszymi augmentacjami dla fine tuning
         fine_transforms = get_augmentations("fine_tune")
         
         train_iam = IAMWordDataset(h5_path=IAM_WORDS_H5_PATH, transform=fine_transforms,
                                    char_list=char_list, name="IAM_Train")
 
-        train_polish = PolishSyntheticDataset(char_map=global_char_map, word_list=polish_words_list,
-                                              transform=fine_transforms, num_samples=12000)
+        train_polish = PolishSyntheticDataset(
+            char_map=global_char_map,
+            word_list=train_polish_words if 'train_polish_words' in locals() else polish_words_list,
+            transform=fine_transforms,
+            num_samples=12000
+        )
         
         # Łączymy zbiory
         fine_tune_dataset = ConcatDataset([train_iam, train_polish])
         
         # Ładujemy najlepsze wagi z fazy main
-        checkpoint = torch.load(os.path.join(CHECKPOINT_FOLDER, "WordLevelResNetCRNN.pth"))
+        best_ckpt_path = CER_PATH if os.path.exists(CER_PATH) else os.path.join(CHECKPOINT_FOLDER, "WordLevelResNetCRNN.pth")
+        checkpoint = torch.load(best_ckpt_path, map_location=DEVICE, weights_only=False)
 
         # Bezpieczne wczytywanie niezależnie od tego, czy użyto 'model_state' czy 'model_state_dict'
-        state_key = 'model_state' if 'model_state' in checkpoint else ('model_state_dict' if 'model_state_dict' in checkpoint else None)
-        if state_key is None:
+        if isinstance(checkpoint, dict) and ('model_state' in checkpoint or 'model_state_dict' in checkpoint):
+            state_key = 'model_state' if 'model_state' in checkpoint else 'model_state_dict'
+            model.load_state_dict(checkpoint[state_key])
+        elif isinstance(checkpoint, dict):
+            model.load_state_dict(checkpoint)
+        else:
             raise KeyError("Nie znaleziono klucza wag modelu ('model_state' ani 'model_state_dict') w wczytanym pth!")
-        model.load_state_dict(checkpoint[state_key])
 
-        # DataLoader-y
+        # Po wczytaniu wag synchronizujemy EMA, aby uniknąć rozbieżności przy pierwszym kroku optymalizacji
+        if isinstance(checkpoint, dict) and ('model_state' in checkpoint or 'model_state_dict' in checkpoint):
+            state_key = 'model_state' if 'model_state' in checkpoint else 'model_state_dict'
+            model.load_state_dict(checkpoint[state_key])
+        else:
+            model.load_state_dict(checkpoint)
+
+        ema_model.update_parameters(model)
+
+        # Wstępny DataLoader-y, balansujące słowa po długości i priorytetujące polskie znaki (do wyznaczenia liczby kroków)
+        epoch = 0
+        fine_sampler, dynamic_weights_map, _ = build_length_balanced_sampler(
+            train_iam,
+            train_polish,
+            current_epoch=epoch,
+            total_epochs=EPOCHS_FINE_TUNE,
+        )
         train_loader = DataLoader(
-            fine_tune_dataset, batch_size=BATCH_SIZE, num_workers=WORKERS_FINE,
-            collate_fn=collate_fn_dynamic, pin_memory=False, worker_init_fn=worker_init_fn, shuffle=True
+            fine_tune_dataset, batch_size=BATCH_SIZE, sampler=fine_sampler, shuffle=False,
+            num_workers=WORKERS_FINE, collate_fn=collate_fn_dynamic,
+            pin_memory=False, persistent_workers=False, worker_init_fn=worker_init_fn
         )
         val_loader = DataLoader(
         val_dataset, 
@@ -4238,9 +4386,16 @@ if __name__ == "__main__":
         patience = 3
         patience_counter = 0
 
-        for epoch in range(EPOCHS_FINE_TUNE):
+        fine_epoch_bar = epoch_progress_bar(
+            range(EPOCHS_FINE_TUNE),
+            total_epochs=EPOCHS_FINE_TUNE,
+            stage_name="CRNN Fine-tune",
+            initial=0,
+        )
+        for epoch in fine_epoch_bar:
+            fine_epoch_bar.set_description_str(f"CRNN Fine-tune | Epoka {epoch + 1}/{EPOCHS_FINE_TUNE}")
             # Zabezpieczenie przed brakiem zmiennej early_stopping_epoch przy wznawianiu
-            base_epoch = 0
+            base_epoch = EPOCHS_MAIN
             if 'early_stopping_epoch' in locals():
                 base_epoch = early_stopping_epoch
             else:
@@ -4249,10 +4404,32 @@ if __name__ == "__main__":
                     base_epoch = checkpoint['epoch']
 
             current_total_epoch = base_epoch + epoch + 1
-            tqdm.write(f"[{now()}] Epoka {current_total_epoch} Fine-tune")
+
+            # Aktualizacja samplera, train_loader i val_loader dla bieżącej epoki Fine tune
+            fine_sampler, dynamic_weights_map, _ = build_length_balanced_sampler(
+                train_iam,
+                train_polish,
+                current_epoch=epoch,
+                total_epochs=EPOCHS_FINE_TUNE,
+            )
+            train_loader = DataLoader(
+                fine_tune_dataset, batch_size=BATCH_SIZE, sampler=fine_sampler, shuffle=False,
+                num_workers=WORKERS_FINE, collate_fn=collate_fn_dynamic,
+                pin_memory=False, persistent_workers=False, worker_init_fn=worker_init_fn
+            )
+            val_loader = DataLoader(
+                val_dataset, 
+                batch_size=BATCH_SIZE, 
+                shuffle=False,
+                num_workers=0,
+                collate_fn=collate_fn_dynamic, 
+                pin_memory=False
+            )
+
+            tqdm.write(f"[{now()}] Rozpoczynamy Fazę Fine-tune")
             model.set_dropout(0.15)
 
-            # Gamma scheduling dla fine-tune (niższe wartości)
+            # Gamma scheduling dla fine tune (niższe wartości)
             current_gamma = get_focal_gamma_schedule(epoch, EPOCHS_FINE_TUNE, start_gamma=2.0, end_gamma=1.2)
 
             train_loss, e_lrs, e_moms = train_one_epoch(
@@ -4284,16 +4461,22 @@ if __name__ == "__main__":
                 use_focal=True, 
                 focal_gamma=current_gamma
             )
+            fine_epoch_bar.set_postfix(loss=f"{train_loss:.4f}", val=f"{val_loss:.4f}")
             tqdm.write(f"          Fine Loss: {val_loss:.4f}")
 
             with open(history_path, "w") as f:
                 json.dump(history, f)
 
-            # Zapisujemy tylko najostrzejszy model z uwzględnieniem Early Stopping
+            # Zapisujemy model po poprawie, używamy early stopping
             if val_loss < best_fine_loss:
                 best_fine_loss = val_loss
-                torch.save({'model_state': model.state_dict(), 'epoch': current_total_epoch}, CER_PATH)
-                tqdm.write("              └─> Nowy rekord! Zapisano checkpoint modelu.")
+                torch.save({
+                    'model_state': model.state_dict(),
+                    'ema_state': ema_model.module.state_dict() if ema_model is not None else model.state_dict(),
+                    'epoch': current_total_epoch,
+                    'gamma': current_gamma,
+                }, CER_PATH)
+                tqdm.write("              └─> Nowy rekord! Zapisano checkpoint modelu i wagi EMA.")
                 patience_counter = 0  # Resetujemy licznik przy poprawie
             else:
                 patience_counter += 1
@@ -4302,24 +4485,32 @@ if __name__ == "__main__":
                     tqdm.write("              └─> Early Stopping: Przerywamy fine-tuning, aby uniknąć przeuczenia.")
                     break
         
-        tqdm.write(f"[{now()}] Przywracanie wag z rekordowej epoki Fine-tune.")
+        tqdm.write(f"[{now()}] Przywracanie wag z rekordowej epoki Fine  =tune.")
         
         # Odtwarzamy z dysku model, który pobił rekord w pętli
         checkpoint = torch.load(CER_PATH, map_location=DEVICE, weights_only=False)
         
         if isinstance(checkpoint, dict):
-            # Priorytetowe ładowanie wygładzonych wag EMA
+            # Priorytetowe ładowanie wag EMA
             if 'ema_state' in checkpoint:
                 model.load_state_dict(checkpoint['ema_state'])
                 if 'ema_model' in locals() and ema_model is not None:
-                    ema_model.load_state_dict(checkpoint['ema_state'])
-                tqdm.write(f"[{now()}] Pomyślnie załadowano wygładzone wagi EMA/SWA rekordu.")
+                    # Zapisujemy EMA do modelu, aby uniknąć rozbieżności przy ewaluacji
+                    ema_state = checkpoint['ema_state']
+                    if any(k.startswith("module.") for k in ema_state.keys()):
+                        ema_model.load_state_dict(ema_state, strict=False)
+                    else:
+                        ema_model.module.load_state_dict(ema_state, strict=False)
+                    tqdm.write(f"[{now()}] Pomyślnie załadowano wygładzone wagi EMA/SWA rekordu.")
             # Fallback do klasycznych wag
             else:
                 state_key = 'model_state' if 'model_state' in checkpoint else ('model_state_dict' if 'model_state_dict' in checkpoint else None)
-                if state_key is None:
+                if state_key is not None:
+                    model.load_state_dict(checkpoint[state_key])
+                elif any(torch.is_tensor(v) for v in checkpoint.values()):
+                    model.load_state_dict(checkpoint)
+                else:
                     raise KeyError("Nie znaleziono klucza wag modelu w wczytanym pth!")
-                model.load_state_dict(checkpoint[state_key])
                 tqdm.write(f"[{now()}] Załadowano surowe wagi modelu (brak EMA w pliku).")
                 
             final_epoch = checkpoint.get('epoch', current_total_epoch)
@@ -4344,7 +4535,7 @@ if __name__ == "__main__":
         # Nadpisujemy plik docelowy pełną paczką z EMA i prawidłowymi metadanymi
         torch.save({
             'model_state': model.state_dict(),
-            'ema_state': ema_model.state_dict() if 'ema_model' in locals() and ema_model is not None else model.state_dict(),
+            'ema_state': ema_model.module.state_dict() if 'ema_model' in locals() and ema_model is not None else model.state_dict(),
             'best_loss': final_fine_loss,
             'epoch': final_epoch,
             'gamma': eval_gamma # Zapisujemy gammę na przyszłość
@@ -4388,12 +4579,18 @@ if __name__ == "__main__":
             else:
                 # Tworzymy zbiór od nowa
                 fine_transforms = get_augmentations("fine_tune")
-                
-                train_iam = IAMWordDataset(h5_path=IAM_WORDS_H5_PATH, transform=fine_transforms,
-                                        char_list=char_list, name="IAM_Train")
 
-                train_polish = PolishSyntheticDataset(char_map=global_char_map, word_list=polish_words_list,
-                                                    transform=fine_transforms, num_samples=12000)
+                # IAM, dla przyzwyczajenia modelu do naturalnego pisma
+                train_iam = IAMWordDataset(h5_path=IAM_WORDS_H5_PATH, transform=fine_transforms,
+                                       char_list=char_list, name="IAM_Train", split='train')
+
+                # PHSF, żeby nie zapominał polskich znaków
+                train_polish = PolishSyntheticDataset(
+                    char_map=global_char_map,
+                    word_list=train_polish_words if 'train_polish_words' in locals() else polish_words_list,
+                    transform=fine_transforms,
+                    num_samples=12000
+                )
                 
                 # Łączymy zbiory
                 fine_tune_dataset = ConcatDataset([train_iam, train_polish])
@@ -4432,7 +4629,14 @@ if __name__ == "__main__":
         # Bezpieczne pobranie bazowej epoki przed startem klastrowania
         safe_base = early_stopping_epoch if 'early_stopping_epoch' in locals() else last_total_epoch
 
-        for epoch in range(EPOCHS_ALIGN):
+        align_epoch_bar = epoch_progress_bar(
+            range(EPOCHS_ALIGN),
+            total_epochs=EPOCHS_ALIGN,
+            stage_name="CRNN Alignment",
+            initial=0,
+        )
+        for epoch in align_epoch_bar:
+            align_epoch_bar.set_description_str(f"CRNN Alignment | Epoka {epoch + 1}/{EPOCHS_ALIGN}")
             current_align_epoch = epoch + 1
             current_total_epoch = safe_base + current_align_epoch
             
@@ -4467,6 +4671,7 @@ if __name__ == "__main__":
                 use_focal=True,
                 focal_gamma=current_gamma_align 
             )
+            align_epoch_bar.set_postfix(loss=f"{train_loss:.4f}", val=f"{align_val_loss:.4f}")
             tqdm.write(f"          Align Loss: {align_val_loss:.4f} | Aux (Center/Sep) Aktywne")
 
             # Gwarancja zapisu najlepszego wyniku
@@ -4493,20 +4698,20 @@ if __name__ == "__main__":
                 
                 tqdm.write(f"              └─> Nowy rekord Alignment! Zapisano checkpoint pod CapsNet.")
 
-        # Zapis finalnego, przygotowanego pod CapsNet modelu po zakończeniu pętli
+        # Zapis awaryjny tylko wtedy, gdy w pętli nie zapisano żadnego rekordu
         final_aligned_path = os.path.join(CHECKPOINT_FOLDER, "CRNN_Aligned_for_CapsNet.pth")
-        torch.save({
-            'model_state': model.state_dict(),
-            'best_loss': best_align_loss,
-            'epoch': safe_base + EPOCHS_ALIGN
-        }, final_aligned_path)
+        if not os.path.exists(final_aligned_path):
+            torch.save({
+                'model_state': model.state_dict(),
+                'best_loss': best_align_loss,
+                'epoch': safe_base + EPOCHS_ALIGN
+            }, final_aligned_path)
 
-        # Nadpisujemy także CER_PATH, żeby eksport używał tej wersji
-        torch.save({
-            'model_state': model.state_dict(),
-            'best_loss': best_align_loss,
-            'epoch': safe_base + EPOCHS_ALIGN
-        }, CER_PATH)
+            torch.save({
+                'model_state': model.state_dict(),
+                'best_loss': best_align_loss,
+                'epoch': safe_base + EPOCHS_ALIGN
+            }, CER_PATH)
 
         with open(ALIGNMENT_COMPLETE_FILE, 'w') as f:
             f.write(f"Zakończono: {time.ctime()}")
@@ -4534,7 +4739,7 @@ if __name__ == "__main__":
             batch_size=1, # Tylko 1, żeby ograniczyć problemy z łączeniem sekwencji o różnych długościach
             shuffle=False,
             collate_fn=collate_fn_dynamic, # Używamy funkcji collate dla słów
-            num_workers=2
+            num_workers=0 # Nie używamy wielu wątków, żeby uniknąć problemów z HDF5 i zakleszczeniem
         )
 
         tqdm.write(f"[{now()}] Skanowanie walidacji do kalibracji progów niepewności.")
@@ -4691,41 +4896,12 @@ if __name__ == "__main__":
         # Beam decoder do ostatecznej oceny
         detailed_results = evaluate_full_metrics(model, detailed_loader, DEVICE, encoder, decoder=beam_decoder)
         
+        # Na koniec zapisujemy szczegółowe metryki do pliku JSON, aby można było je później analizować
         with open(os.path.join(CHECKPOINT_FOLDER, "final_metrics_report_words.json"), "w") as f:
-            json.dump(detailed_results, f)
+            json.dump(detailed_results, f, ensure_ascii=False, indent=4)
 
+        # I zamykamy TensorBoard i MLFLOW, jeśli były używane
         writer.close()
-        tqdm.write(f"[{now()}] Wszystkie raporty, zbiory danych i wykresy gotowe. Trening CRNN zakończony.")
-
-""" cd /home/marek/OCR/HandwrittenTextRecognition
-    export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-    docker system prune -a -f
-    docker build -t hcr-resnet-crnn .
-    mlflow server --host 0.0.0.0 --port 5000
-    systemd-inhibit docker run -it --rm --name trening_capsnet \
-     --gpus all \
-     --ipc=host \
-     --network=host \
-     --shm-size=16gb \
-     -e PYTHONUNBUFFERED=1 \
-     -e PYTHONPATH=/app \
-     -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-     -v /home/marek/.cache/torch:/root/.cache/torch \
-     -v /home/marek/OCR/HandwrittenTextRecognition/Data:/app/Data:rw \
-     -v /home/marek/OCR/HandwrittenTextRecognition/Data:/app/data:rw \
-     -v /home/marek/OCR/HandwrittenTextRecognition/output_data:/app/output_data \
-     -v /home/marek/OCR/HandwrittenTextRecognition/Models:/app/Models \
-     hcr-resnet-crnn:latest \
-     bash -c "python3 -m pip install --no-cache-dir langdetect shapiq craft-text-detector && python3 -B Models/DeepCapsNetCharRecognition.py"
-  
-    systemd-inhibit blokuje przed uśpieniem systemu w trakcie treningu,
-    -it logi na żywo, --rm usuwanie kontenera od razu po przerwaniu,
-    --name nazwa kontenera, --gpus all wszystkie dostępne rdzenie GPU,   
-    -e PYTHONBUFFERED = 1 wypisywanie logów w czasie rzeczywistym,
-    -v mapuje lokalny folder do kontenera pod podaną ścieżkę,
-    --shm-size - rozmiar pamięci współdzielonej, duży bo wątki przetwarzają obrazy słów,
-    --ipc=host - bezpośredni dostęp do pamięci współdzielonej hosta, brak opóźnień DataLoader -> GPU,
-    --network=host - bezpośredni dostęp do sieci hosta, szybsze logowanie metryk (np. TensorBoard/W&B),
-    :ro (przy Data) - tryb tylko do odczytu, szybsze ładowanie tysięcy małych plików (brak sprawdzania zapisu),
-    -B (przy python3) - blokuje tworzenie plików .pyc, brak śmieci w zmapowanych folderach lokalnych,
-    python3... komenda startująca wewnątrz kontenera """
+        if HAS_MLFLOW:
+            mlflow.end_run()
+        tqdm.write(f"[{now()}] Wszystkie raporty, zbiory danych i checkpointy CRNN zostały pomyślnie wygenerowane.")
