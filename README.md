@@ -44,7 +44,48 @@ The public IP address of the virtual machine `vm-app` for communicating with the
 To train the complete pipeline sequentially, execute the orchestrator script:
 
 ```bash
-python run_all.py
+PROJECT_DIR="$HOME/HCR"
+cd "$PROJECT_DIR"
+
+if [ -f "$PROJECT_DIR/.env" ]; then
+  set -a
+  source "$PROJECT_DIR/.env"
+  set +a
+fi
+
+HF_TOKEN_VAL="${HF_TOKEN:-${HUGGING_FACE_HUB_TOKEN:-}}"
+ENV_FLAG=""
+[ -f "$PROJECT_DIR/.env" ] && ENV_FLAG="--env-file $PROJECT_DIR/.env"
+
+docker rm -f trening_htr mlflow_ui 2>/dev/null || true
+docker compose up -d
+
+gnome-terminal --title="Monitor GPU & Docker" -- bash -c "watch -n 1 'nvidia-smi; echo \"\"; docker ps --format \"table {{.Names}}\t{{.Status}}\"'; exec bash" &
+gnome-terminal --title="MLflow UI" -- bash -c "docker run --rm --name mlflow_ui --network hcr_htr-network -p 5000:5000 $ENV_FLAG -v \"$PROJECT_DIR:/app\" -w /app htr-worker:v6 mlflow ui --host 0.0.0.0 --port 5000; exec bash" &
+
+docker run --rm --name trening_htr \
+    --gpus all \
+    --ipc=host \
+    --network hcr_htr-network \
+    --shm-size=16gb \
+    $ENV_FLAG \
+    -e PYTHONUNBUFFERED=1 \
+    -e PYTHONPATH=/app \
+    -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+    -e HF_TOKEN="$HF_TOKEN_VAL" \
+    -e HUGGING_FACE_HUB_TOKEN="$HF_TOKEN_VAL" \
+    -e HF_HUB_VERBOSITY=error \
+    -e HF_HUB_DISABLE_IMPLICIT_TOKEN=0 \
+    -e MONGO_URL="mongodb://htr_mongo:27017" \
+    -e REDIS_HOST="htr_redis" \
+    -e REDIS_URL="redis://htr_redis:6379/0" \
+    -e MINIO_URL="minio:9000" \
+    -v "$HOME/.cache/torch:/root/.cache/torch" \
+    -v "$HOME/.cache/huggingface:/root/.cache/huggingface" \
+    -v "$PROJECT_DIR:/app" \
+    -v "$PROJECT_DIR/Data:/app/data:rw" \
+    htr-worker:v6 \
+    python3 -B run_all.py
 ```
 
 This script handles the verification and execution of each training phase step by step:
